@@ -10,8 +10,8 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "node src/server.mjs",
-    "dev": "node --watch src/server.mjs",
+    "start": "node src/commercial.server.mjs",
+    "dev": "node --watch src/commercial.server.mjs",
     "lint": "node -e \"console.log('lint placeholder')\""
   },
   "dependencies": {
