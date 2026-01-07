@@ -5,17 +5,24 @@ const SCHEMA_HOST = (process.env.SCHEMA_HOST || "https://www.commandlayer.org").
 const FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 15000);
 const COMPILE_TIMEOUT_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 15000);
 
-const schemaCache = new Map();   // url -> { t, json }
-const validatorCache = new Map(); // verb -> validate
+const schemaCache = new Map();      // url -> { t, json }
+const validatorCache = new Map();   // verb -> validate
 
 function normalizeUrl(url) {
   let u = String(url || "");
+
+  // force https
   u = u.replace(/^http:\/\//i, "https://");
+
+  // unify host (avoid redirects / host mismatch across $id and refs)
   u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
+  u = u.replace(/^https:\/\/www\.commandlayer\.org\/+/, "https://www.commandlayer.org/");
+
   return u;
 }
 
 async function withTimeout(p, ms, label) {
+  if (!ms || ms <= 0) return await p;
   return await Promise.race([
     p,
     new Promise((_, rej) => setTimeout(() => rej(new Error(label || "timeout")), ms)),
@@ -29,9 +36,16 @@ async function fetchJson(url) {
 
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+
   try {
-    const resp = await fetch(u, { headers: { accept: "application/json" }, signal: ac.signal, redirect: "follow" });
+    const resp = await fetch(u, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: ac.signal,
+      redirect: "follow",
+    });
     if (!resp.ok) throw new Error(`schema fetch failed: ${resp.status} ${resp.statusText}`);
+
     const json = await resp.json();
     schemaCache.set(u, { t: Date.now(), json });
     return json;
@@ -56,11 +70,12 @@ export function receiptSchemaUrlForVerb(verb) {
 }
 
 export async function getValidatorForVerb(verb) {
+  if (!verb) throw new Error("missing verb");
   if (validatorCache.has(verb)) return validatorCache.get(verb);
 
   const ajv = makeAjv();
 
-  // best-effort preload common refs
+  // best-effort preload shared refs (both global and commercial shared)
   const shared = [
     `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
     `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
@@ -73,6 +88,7 @@ export async function getValidatorForVerb(verb) {
 
   const schema = await fetchJson(receiptSchemaUrlForVerb(verb));
   const validate = await withTimeout(ajv.compileAsync(schema), COMPILE_TIMEOUT_MS, "ajv_compile_timeout");
+
   validatorCache.set(verb, validate);
   return validate;
 }
