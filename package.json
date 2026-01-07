@@ -1,0 +1,23 @@
+{
+  "name": "@commandlayer/commercial-runtime",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "CommandLayer commercial runtime (authorize, checkout, purchase, ship, verify) with pricing, limits, receipts.",
+  "author": "CommandLayer",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "lint": "node -e \"console.log('lint placeholder')\""
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "ethers": "^6.12.1",
+    "express": "^4.22.1"
+  }
+}
