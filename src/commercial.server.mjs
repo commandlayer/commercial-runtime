@@ -1,3 +1,10 @@
+// src/server.mjs
+// CommandLayer — Commercial Runtime
+// Verbs: authorize, checkout, purchase, ship, verify
+//
+// Start (local):  PORT=8090 node commercial.server.mjs
+// Start (direct): PORT=8090 node src/server.mjs
+
 import express from "express";
 import crypto from "crypto";
 
@@ -12,16 +19,23 @@ import purchase from "./verbs/purchase.mjs";
 import ship from "./verbs/ship.mjs";
 import verifyVerb from "./verbs/verify.mjs";
 
-const handlers = { authorize, checkout, purchase, ship, verify: verifyVerb };
+const handlers = {
+  authorize,
+  checkout,
+  purchase,
+  ship,
+  verify: verifyVerb,
+};
 
 function nowIso() {
   return new Date().toISOString();
 }
+
 function randId(prefix = "trace_") {
   return prefix + crypto.randomBytes(6).toString("hex");
 }
 
-function enabledList() {
+function parseEnabledVerbs() {
   return (process.env.ENABLED_VERBS || "authorize,checkout,purchase,ship,verify")
     .split(",")
     .map((s) => s.trim())
@@ -36,11 +50,47 @@ function requireJsonBody(req, res) {
   return true;
 }
 
+// -----------------------
+// Optional: schema warm queue (edge-safe-ish)
+// -----------------------
+const warmQueue = new Set();
+let warmRunning = false;
+
+function startWarmWorker() {
+  if (warmRunning) return;
+  warmRunning = true;
+
+  setTimeout(async () => {
+    try {
+      const { getValidatorForVerb } = await import("./receipts/schema.mjs");
+
+      // best-effort: warm up to N per run
+      const MAX_PER_RUN = Number(process.env.PREWARM_MAX_VERBS || 25);
+      let n = 0;
+
+      while (warmQueue.size > 0 && n < MAX_PER_RUN) {
+        const verb = warmQueue.values().next().value;
+        warmQueue.delete(verb);
+        n++;
+
+        try {
+          await getValidatorForVerb(verb);
+        } catch {
+          // swallow; warm is best-effort
+        }
+      }
+    } finally {
+      warmRunning = false;
+      if (warmQueue.size > 0) startWarmWorker();
+    }
+  }, 0);
+}
+
 export function buildApp() {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
 
-  // CORS
+  // CORS (no dependency)
   app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -51,24 +101,28 @@ export function buildApp() {
 
   const PORT = Number(process.env.PORT || 8080);
 
+  // Identity
   const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-commercial-runtime";
   const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
   const API_VERSION = process.env.API_VERSION || "1.0.0";
 
-  // If Railway, prefer public domain as canonical base
-  const railwayDomain =
-    process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null;
+  // Canonical base:
+  // - On Railway, RAILWAY_PUBLIC_DOMAIN is the best default
+  // - Otherwise local
+  const railwayBase = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null;
+  const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || railwayBase || `http://localhost:${PORT}`).replace(
+    /\/+$/,
+    ""
+  );
 
-  const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || railwayDomain || `http://localhost:${PORT}`)
-    .replace(/\/+$/, "");
+  const ENABLED_VERBS = parseEnabledVerbs();
+  const enabled = (verb) => ENABLED_VERBS.includes(verb);
 
-  const ENABLED_VERBS = enabledList();
-
+  // Receipt signer label (not the key itself)
   const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "commercial-runtime";
 
+  // Pricing rules (static JSON + env overrides handled inside facilitator)
   const pricing = loadPricing();
-
-  const enabled = (verb) => ENABLED_VERBS.includes(verb);
 
   async function handleVerb(verb, req, res) {
     if (!enabled(verb)) {
@@ -81,7 +135,7 @@ export function buildApp() {
 
     const started = Date.now();
 
-    // parent trace id allowed if provided
+    // parent trace id allowed if provided (string + non-empty)
     const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
     const parent_trace_id = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
 
@@ -94,7 +148,7 @@ export function buildApp() {
       provider: process.env.RAILWAY_SERVICE_NAME || "commercial-runtime",
     };
 
-    // default x402 if caller omitted
+    // Default x402 if caller omitted
     const x402 = req.body?.x402 || {
       verb,
       version: "1.0.0",
@@ -104,10 +158,10 @@ export function buildApp() {
     try {
       const actor = resolveActor(req);
 
-      // limits + billing decision (free vs paid)
+      // Decide free vs paid + enforce limits
       const decision = await applyLimits({ req, verb, pricing, actor });
 
-      // execute verb deterministically
+      // Execute verb deterministically (your verb modules can call Stripe/crypto later)
       const result = await handlers[verb]({ body: req.body, actor, pricing, decision });
 
       trace.completed_at = nowIso();
@@ -164,7 +218,9 @@ export function buildApp() {
     }
   }
 
-  // index
+  // -----------------------
+  // Index / Health / Debug
+  // -----------------------
   app.get("/", (req, res) => {
     res.json({
       ok: true,
@@ -177,18 +233,20 @@ export function buildApp() {
       verify: "/verify",
       debug_env: "/debug/env",
       debug_validators: "/debug/validators",
+      debug_prewarm: "/debug/prewarm",
       verbs: (ENABLED_VERBS || []).map((v) => `/${v}/v${API_VERSION}`),
       time: nowIso(),
     });
   });
 
-  // health
   app.get("/health", (req, res) => {
     res.json({
       ok: true,
       service: SERVICE_NAME,
       version: SERVICE_VERSION,
       api_version: API_VERSION,
+      base: CANONICAL_BASE,
+      node: process.version,
       port: PORT,
       enabled_verbs: ENABLED_VERBS,
       signer_id: SIGNER_ID,
@@ -196,10 +254,8 @@ export function buildApp() {
     });
   });
 
-  // pricing
   app.get("/.well-known/pricing.json", (req, res) => res.json(pricing));
 
-  // debug env
   app.get("/debug/env", (req, res) => {
     res.json({
       ok: true,
@@ -212,26 +268,48 @@ export function buildApp() {
       billing_provider: process.env.BILLING_PROVIDER || "none",
       verifier_ens_name: process.env.VERIFIER_ENS_NAME || null,
       ens_pubkey_text_key: process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem",
+      canonical_base_url: CANONICAL_BASE,
       time: nowIso(),
     });
   });
 
-  // debug validators (AJV cache state)
   app.get("/debug/validators", async (req, res) => {
     try {
       const { debugState } = await import("./receipts/schema.mjs");
-      res.json({ ok: true, ...debugState() });
+      res.json({ ok: true, ...debugState(), warm_queue_size: warmQueue.size, warm_running: warmRunning });
     } catch (e) {
       res.status(500).json({ ok: false, error: e?.message || "debug failed" });
     }
   });
 
-  // verb routes
+  // Fire-and-forget warm (safe endpoint to call after deploy)
+  app.post("/debug/prewarm", async (req, res) => {
+    const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs : [];
+    const cleaned = verbs.map((v) => String(v || "").trim()).filter(Boolean);
+    const supported = cleaned.filter((v) => enabled(v));
+
+    for (const v of supported) warmQueue.add(v);
+
+    res.json({
+      ok: true,
+      queued: supported,
+      queue_size: warmQueue.size,
+      note: "Warm runs after response; poll /debug/validators.",
+    });
+
+    startWarmWorker();
+  });
+
+  // -----------------------
+  // Verb routes
+  // -----------------------
   for (const v of Object.keys(handlers)) {
     app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
   }
 
-  // verify a receipt (signature/hash + optional schema + optional ens)
+  // -----------------------
+  // Verify (receipt hash+sig + optional schema + optional ens)
+  // -----------------------
   app.post("/verify", async (req, res) => {
     try {
       const wantEns = String(req.query.ens || "0") === "1";
@@ -240,7 +318,7 @@ export function buildApp() {
 
       const receipt = req.body;
 
-      // 1) hash+sig
+      // 1) hash+sig (optionally ENS)
       const sigOut = await makeReceipt.verify({ receipt, wantEns, refresh });
 
       // 2) schema (commercial)
@@ -299,9 +377,10 @@ export function buildApp() {
 export function start() {
   const { app, PORT } = buildApp();
 
-  // Railway expects 0.0.0.0 binding
+  // IMPORTANT: Railway needs 0.0.0.0 binding
   const host = process.env.HOST || "0.0.0.0";
 
+  console.log("boot: commandlayer-commercial-runtime");
   const server = app.listen(PORT, host, () => {
     console.log(`commercial runtime listening on http://${host}:${PORT}`);
   });
