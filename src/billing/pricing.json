@@ -1,0 +1,11 @@
+{
+  "currency": "USD",
+  "free_tier": { "calls_per_day": 100, "burst_rps": 3 },
+  "verbs": {
+    "authorize": { "unit_price": 0.010, "unit": "call" },
+    "checkout":  { "unit_price": 0.020, "unit": "call" },
+    "purchase":  { "unit_price": 0.030, "unit": "call" },
+    "ship":      { "unit_price": 0.015, "unit": "call" },
+    "verify":    { "unit_price": 0.005, "unit": "call" }
+  }
+}
