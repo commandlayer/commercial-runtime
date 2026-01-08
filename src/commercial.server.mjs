@@ -1,8 +1,9 @@
 // src/commercial.server.mjs
-// CommandLayer — Commercial Runtime
+// CommandLayer — Commercial Runtime (edge-safe)
 // Verbs: authorize, checkout, purchase, ship, verify
 //
-// Start: PORT=8090 node src/commercial.server.mjs
+// Start (local):  PORT=8090 node src/commercial.server.mjs
+// Start (Railway): uses PORT + HOST=0.0.0.0
 
 import express from "express";
 import crypto from "crypto";
@@ -49,24 +50,53 @@ function requireJsonBody(req, res) {
   return true;
 }
 
-function safeJson(res, http, payload) {
-  try {
-    return res.status(http).json(payload);
-  } catch {
-    return res.status(http).end(JSON.stringify(payload));
-  }
+function respondNoStore(res) {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
 }
 
+function safeErrObj(e, verb) {
+  return {
+    code: String(e?.code || "INTERNAL_ERROR"),
+    message: String(e?.message || "unknown error").slice(0, 2048),
+    retryable: Boolean(e?.retryable),
+    details: { verb },
+  };
+}
+
+// IMPORTANT: never let receipt signing failures prevent an HTTP response.
+// This converts signing problems into a normal JSON error you can see.
 function safeMakeReceipt(args) {
   try {
-    return { ok: true, receipt: makeReceipt(args) };
+    return makeReceipt(args);
   } catch (e) {
-    return { ok: false, error: e };
+    return {
+      status: "error",
+      x402: args?.x402 || null,
+      trace: args?.trace || null,
+      error: {
+        code: "RECEIPT_SIGNING_FAILED",
+        message: String(e?.message || e).slice(0, 2048),
+        retryable: false,
+        details: { signer_id: args?.signer_id || null },
+      },
+      actor: args?.actor || null,
+      metadata: {
+        proof: {
+          alg: "ed25519-sha256",
+          canonical: "json-stringify",
+          signer_id: args?.signer_id || null,
+          hash_sha256: null,
+          signature_b64: null,
+        },
+        receipt_id: null,
+      },
+    };
   }
 }
 
 // -----------------------
-// Optional: schema warm queue (edge-safe-ish)
+// Optional: schema warm queue (best-effort)
 // -----------------------
 const warmQueue = new Set();
 let warmRunning = false;
@@ -78,7 +108,6 @@ function startWarmWorker() {
   setTimeout(async () => {
     try {
       const { getValidatorForVerb } = await import("./receipts/schema.mjs");
-
       const MAX_PER_RUN = Number(process.env.PREWARM_MAX_VERBS || 25);
       let n = 0;
 
@@ -90,7 +119,7 @@ function startWarmWorker() {
         try {
           await getValidatorForVerb(verb);
         } catch {
-          // best-effort warm
+          // best-effort only
         }
       }
     } finally {
@@ -100,11 +129,47 @@ function startWarmWorker() {
   }, 0);
 }
 
+function keyHealth() {
+  // We do NOT log the keys; just report presence + parsability.
+  const privB64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
+  const pubB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+
+  const out = {
+    has_priv_b64: !!privB64,
+    has_pub_b64: !!pubB64,
+    priv_ok: false,
+    pub_ok: false,
+    error: null,
+  };
+
+  try {
+    if (privB64) {
+      const pem = Buffer.from(privB64, "base64").toString("utf8");
+      crypto.createPrivateKey(pem);
+      out.priv_ok = true;
+    }
+  } catch (e) {
+    out.error = `private_key_invalid: ${String(e?.message || e)}`;
+  }
+
+  try {
+    if (pubB64) {
+      const pem = Buffer.from(pubB64, "base64").toString("utf8");
+      crypto.createPublicKey(pem);
+      out.pub_ok = true;
+    }
+  } catch (e) {
+    out.error = out.error || `public_key_invalid: ${String(e?.message || e)}`;
+  }
+
+  return out;
+}
+
 export function buildApp() {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
 
-  // ---- basic CORS (no dependency)
+  // CORS (no dependency)
   app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -115,21 +180,18 @@ export function buildApp() {
 
   const PORT = Number(process.env.PORT || 8080);
 
-  // ---- service identity / discovery
+  // Identity
   const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-commercial-runtime";
   const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
   const API_VERSION = process.env.API_VERSION || "1.0.0";
 
   // Canonical base:
-  // - On Railway, RAILWAY_PUBLIC_DOMAIN is the best default
-  // - Otherwise local
   const railwayBase = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null;
   const CANONICAL_BASE = (process.env.CANONICAL_BASE_URL || railwayBase || `http://localhost:${PORT}`).replace(
     /\/+$/,
     ""
   );
 
-  // ---- runtime config
   const ENABLED_VERBS = parseEnabledVerbs();
   const enabled = (verb) => ENABLED_VERBS.includes(verb);
 
@@ -141,10 +203,12 @@ export function buildApp() {
 
   async function handleVerb(verb, req, res) {
     if (!enabled(verb)) {
-      return res.status(404).json({ status: "error", code: 404, message: `Verb not enabled: ${verb}` });
+      respondNoStore(res);
+      return res.status(404).end(JSON.stringify({ status: "error", code: 404, message: `Verb not enabled: ${verb}` }));
     }
     if (!handlers[verb]) {
-      return res.status(404).json({ status: "error", code: 404, message: `Verb not supported: ${verb}` });
+      respondNoStore(res);
+      return res.status(404).end(JSON.stringify({ status: "error", code: 404, message: `Verb not supported: ${verb}` }));
     }
     if (!requireJsonBody(req, res)) return;
 
@@ -170,20 +234,19 @@ export function buildApp() {
       entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
     };
 
-    // Resolve actor once; reuse on both success/error
-    const actor = resolveActor(req);
-
     try {
+      const actor = resolveActor(req);
+
       // Decide free vs paid + enforce limits
       const decision = await applyLimits({ req, verb, pricing, actor });
 
-      // Execute verb deterministically (your verb modules can call Stripe/crypto later)
+      // Execute verb deterministically (verb modules may call Stripe/crypto later)
       const result = await handlers[verb]({ body: req.body, actor, pricing, decision });
 
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
 
-      const out = safeMakeReceipt({
+      const receipt = safeMakeReceipt({
         signer_id: SIGNER_ID,
         x402,
         trace,
@@ -203,30 +266,16 @@ export function buildApp() {
         },
       });
 
-      if (!out.ok) {
-        console.error("receipt_sign_failed(success):", out.error?.stack || out.error);
-        return safeJson(res, 500, {
-          status: "error",
-          code: 500,
-          message: "receipt signing failed",
-          details: { verb, where: "success" },
-          time: nowIso(),
-        });
-      }
-
-      return res.json(out.receipt);
+      respondNoStore(res);
+      return res.status(200).end(JSON.stringify(receipt));
     } catch (e) {
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
 
-      const err = {
-        code: String(e?.code || "INTERNAL_ERROR"),
-        message: String(e?.message || "unknown error").slice(0, 2048),
-        retryable: Boolean(e?.retryable),
-        details: { verb },
-      };
+      const actor = resolveActor(req);
+      const err = safeErrObj(e, verb);
 
-      const out = safeMakeReceipt({
+      const receipt = safeMakeReceipt({
         signer_id: SIGNER_ID,
         x402,
         trace,
@@ -238,21 +287,9 @@ export function buildApp() {
         },
       });
 
-      const http = Number(e?.http_status || 500);
-
-      if (!out.ok) {
-        console.error("receipt_sign_failed(error):", out.error?.stack || out.error);
-        return safeJson(res, http, {
-          status: "error",
-          code: http,
-          message: err.message,
-          details: err.details,
-          note: "also failed to sign receipt",
-          time: nowIso(),
-        });
-      }
-
-      return res.status(http).json(out.receipt);
+      const http = Number(e?.http_status || e?.status || 500);
+      respondNoStore(res);
+      return res.status(http).end(JSON.stringify(receipt));
     }
   }
 
@@ -260,63 +297,122 @@ export function buildApp() {
   // Index / Health / Debug
   // -----------------------
   app.get("/", (req, res) => {
-    res.json({
-      ok: true,
-      service: SERVICE_NAME,
-      version: SERVICE_VERSION,
-      api_version: API_VERSION,
-      base: CANONICAL_BASE,
-      health: "/health",
-      pricing: "/.well-known/pricing.json",
-      verify: "/verify",
-      debug_env: "/debug/env",
-      debug_validators: "/debug/validators",
-      debug_prewarm: "/debug/prewarm",
-      verbs: (ENABLED_VERBS || []).map((v) => `/${v}/v${API_VERSION}`),
-      time: nowIso(),
-    });
+    respondNoStore(res);
+    res.status(200).end(
+      JSON.stringify({
+        ok: true,
+        service: SERVICE_NAME,
+        version: SERVICE_VERSION,
+        api_version: API_VERSION,
+        base: CANONICAL_BASE,
+        health: "/health",
+        pricing: "/.well-known/pricing.json",
+        verify: "/verify",
+        debug_env: "/debug/env",
+        debug_signer: "/debug/signer",
+        debug_validators: "/debug/validators",
+        debug_prewarm: "/debug/prewarm",
+        verbs: (ENABLED_VERBS || []).map((v) => `/${v}/v${API_VERSION}`),
+        time: nowIso(),
+      })
+    );
   });
 
   app.get("/health", (req, res) => {
-    res.json({
-      ok: true,
-      service: SERVICE_NAME,
-      version: SERVICE_VERSION,
-      api_version: API_VERSION,
-      base: CANONICAL_BASE,
-      node: process.version,
-      port: PORT,
-      enabled_verbs: ENABLED_VERBS,
-      signer_id: SIGNER_ID,
-      time: nowIso(),
-    });
+    const kh = keyHealth();
+    respondNoStore(res);
+    res.status(200).end(
+      JSON.stringify({
+        ok: true,
+        service: SERVICE_NAME,
+        version: SERVICE_VERSION,
+        api_version: API_VERSION,
+        base: CANONICAL_BASE,
+        node: process.version,
+        port: PORT,
+        enabled_verbs: ENABLED_VERBS,
+        signer_id: SIGNER_ID,
+        signer_ok: !!kh.priv_ok,
+        keys: { has_priv_b64: kh.has_priv_b64, has_pub_b64: kh.has_pub_b64, priv_ok: kh.priv_ok, pub_ok: kh.pub_ok },
+        time: nowIso(),
+      })
+    );
   });
 
-  app.get("/.well-known/pricing.json", (req, res) => res.json(pricing));
+  app.get("/.well-known/pricing.json", (req, res) => {
+    respondNoStore(res);
+    res.status(200).end(JSON.stringify(pricing));
+  });
 
   app.get("/debug/env", (req, res) => {
-    res.json({
-      ok: true,
-      node: process.version,
-      port: PORT,
-      service: process.env.RAILWAY_SERVICE_NAME || "commercial-runtime",
-      enabled_verbs: ENABLED_VERBS,
+    const kh = keyHealth();
+    respondNoStore(res);
+    res.status(200).end(
+      JSON.stringify({
+        ok: true,
+        node: process.version,
+        port: PORT,
+        service: process.env.RAILWAY_SERVICE_NAME || "commercial-runtime",
+        enabled_verbs: ENABLED_VERBS,
+        signer_id: SIGNER_ID,
+        canonical_base_url: CANONICAL_BASE,
+        schema_host: process.env.SCHEMA_HOST || "https://www.commandlayer.org",
+        billing_provider: process.env.BILLING_PROVIDER || "none",
+        verifier_ens_name: process.env.VERIFIER_ENS_NAME || null,
+        ens_pubkey_text_key: process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem",
+        keys: kh,
+        time: nowIso(),
+      })
+    );
+  });
+
+  // signer self-test: proves keys are usable (no secrets)
+  app.get("/debug/signer", async (req, res) => {
+    respondNoStore(res);
+
+    const msg = "ping:" + nowIso();
+    const sha = crypto.createHash("sha256").update(msg).digest("hex");
+
+    const out = {
+      ok: false,
       signer_id: SIGNER_ID,
-      schema_host: process.env.SCHEMA_HOST || "https://www.commandlayer.org",
-      billing_provider: process.env.BILLING_PROVIDER || "none",
-      verifier_ens_name: process.env.VERIFIER_ENS_NAME || null,
-      ens_pubkey_text_key: process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem",
-      canonical_base_url: CANONICAL_BASE,
-      time: nowIso(),
-    });
+      has_priv_b64: !!process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64,
+      has_pub_b64: !!process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64,
+      sign_ok: false,
+      verify_ok_env_pub: false,
+      error: null,
+      values: { msg, sha256: sha },
+    };
+
+    try {
+      const privPem = Buffer.from(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "", "base64").toString("utf8");
+      const pubPem = Buffer.from(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "", "base64").toString("utf8");
+
+      const priv = crypto.createPrivateKey(privPem);
+      const pub = crypto.createPublicKey(pubPem);
+
+      const sig = crypto.sign(null, Buffer.from(sha, "utf8"), priv);
+      out.sign_ok = true;
+
+      const ok = crypto.verify(null, Buffer.from(sha, "utf8"), pub, sig);
+      out.verify_ok_env_pub = !!ok;
+
+      out.ok = out.sign_ok && out.verify_ok_env_pub;
+      return res.status(out.ok ? 200 : 500).end(JSON.stringify(out));
+    } catch (e) {
+      out.error = String(e?.message || e).slice(0, 2048);
+      out.ok = false;
+      return res.status(500).end(JSON.stringify(out));
+    }
   });
 
   app.get("/debug/validators", async (req, res) => {
+    respondNoStore(res);
     try {
       const { debugState } = await import("./receipts/schema.mjs");
-      res.json({ ok: true, ...debugState(), warm_queue_size: warmQueue.size, warm_running: warmRunning });
+      res.status(200).end(JSON.stringify({ ok: true, ...debugState(), warm_queue_size: warmQueue.size, warm_running: warmRunning }));
     } catch (e) {
-      res.status(500).json({ ok: false, error: e?.message || "debug failed" });
+      res.status(500).end(JSON.stringify({ ok: false, error: e?.message || "debug failed" }));
     }
   });
 
@@ -328,12 +424,15 @@ export function buildApp() {
 
     for (const v of supported) warmQueue.add(v);
 
-    res.json({
-      ok: true,
-      queued: supported,
-      queue_size: warmQueue.size,
-      note: "Warm runs after response; poll /debug/validators.",
-    });
+    respondNoStore(res);
+    res.status(200).end(
+      JSON.stringify({
+        ok: true,
+        queued: supported,
+        queue_size: warmQueue.size,
+        note: "Warm runs after response; poll /debug/validators.",
+      })
+    );
 
     startWarmWorker();
   });
@@ -349,6 +448,8 @@ export function buildApp() {
   // Verify (receipt hash+sig + optional schema + optional ens)
   // -----------------------
   app.post("/verify", async (req, res) => {
+    respondNoStore(res);
+
     try {
       const wantEns = String(req.query.ens || "0") === "1";
       const refresh = String(req.query.refresh || "0") === "1";
@@ -385,27 +486,29 @@ export function buildApp() {
 
       const ok = !!sigOut.ok && !!schemaOk;
 
-      return res.status(ok ? 200 : 400).json({
-        ok,
-        checks: {
-          hash_matches: sigOut?.checks?.hash_matches ?? false,
-          signature_valid: sigOut?.checks?.signature_valid ?? false,
-          schema_valid: schemaOk,
-        },
-        values: {
-          verb: receipt?.x402?.verb ?? null,
-          signer_id: receipt?.metadata?.proof?.signer_id ?? null,
-          claimed_hash: receipt?.metadata?.proof?.hash_sha256 ?? null,
-          recomputed_hash: sigOut?.values?.recomputed_hash ?? null,
-          pubkey_source: sigOut?.values?.pubkey_source ?? null,
-        },
-        errors: {
-          signature_error: sigOut?.errors?.signature_error ?? null,
-          schema_errors: schemaErrors,
-        },
-      });
+      return res.status(ok ? 200 : 400).end(
+        JSON.stringify({
+          ok,
+          checks: {
+            hash_matches: sigOut?.checks?.hash_matches ?? false,
+            signature_valid: sigOut?.checks?.signature_valid ?? false,
+            schema_valid: schemaOk,
+          },
+          values: {
+            verb: receipt?.x402?.verb ?? null,
+            signer_id: receipt?.metadata?.proof?.signer_id ?? null,
+            claimed_hash: receipt?.metadata?.proof?.hash_sha256 ?? null,
+            recomputed_hash: sigOut?.values?.recomputed_hash ?? null,
+            pubkey_source: sigOut?.values?.pubkey_source ?? null,
+          },
+          errors: {
+            signature_error: sigOut?.errors?.signature_error ?? null,
+            schema_errors: schemaErrors,
+          },
+        })
+      );
     } catch (e) {
-      return res.status(500).json({ ok: false, error: e?.message || "verify failed" });
+      return res.status(500).end(JSON.stringify({ ok: false, error: e?.message || "verify failed" }));
     }
   });
 
@@ -414,8 +517,6 @@ export function buildApp() {
 
 export function start() {
   const { app, PORT } = buildApp();
-
-  // IMPORTANT: Railway needs 0.0.0.0 binding
   const host = process.env.HOST || "0.0.0.0";
 
   console.log("boot: commandlayer-commercial-runtime");
