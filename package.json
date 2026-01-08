@@ -1,17 +1,31 @@
 {
   "name": "@commandlayer/commercial-runtime",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "description": "CommandLayer commercial runtime (authorize, checkout, purchase, ship, verify) with pricing, limits, receipts.",
   "author": "CommandLayer",
   "license": "Apache-2.0",
+  "main": "src/commercial.server.mjs",
+  "files": [
+    "src/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/commandlayer/commercial-runtime.git"
+  },
+  "bugs": {
+    "url": "https://github.com/commandlayer/commercial-runtime/issues"
+  },
+  "homepage": "https://commandlayer.org",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
     "start": "node src/commercial.server.mjs",
-    "dev": "node --watch src/commercial.server.mjs",
+    "dev": "cross-env NODE_ENV=development node --watch src/commercial.server.mjs",
     "lint": "node -e \"console.log('lint placeholder')\""
   },
   "dependencies": {
@@ -19,5 +33,8 @@
     "ajv-formats": "^3.0.1",
     "ethers": "^6.12.1",
     "express": "^4.22.1"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
   }
 }
