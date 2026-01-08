@@ -1,9 +1,9 @@
-// src/server.mjs
+// src/commercial.server.mjs
 // CommandLayer — Commercial Runtime
 // Verbs: authorize, checkout, purchase, ship, verify
 //
-// Start (local):  PORT=8090 node commercial.server.mjs
-// Start (direct): PORT=8090 node src/server.mjs
+// Start (local):  PORT=8090 node src/commercial.server.mjs
+// Package script: "start": "node src/commercial.server.mjs"
 
 import express from "express";
 import crypto from "crypto";
@@ -26,6 +26,8 @@ const handlers = {
   ship,
   verify: verifyVerb,
 };
+
+const API_VERSION_DEFAULT = "1.0.0";
 
 function nowIso() {
   return new Date().toISOString();
@@ -56,7 +58,7 @@ function requireJsonBody(req, res) {
 const warmQueue = new Set();
 let warmRunning = false;
 
-function startWarmWorker() {
+function startWarmWorker({ enabled, supported }) {
   if (warmRunning) return;
   warmRunning = true;
 
@@ -64,7 +66,6 @@ function startWarmWorker() {
     try {
       const { getValidatorForVerb } = await import("./receipts/schema.mjs");
 
-      // best-effort: warm up to N per run
       const MAX_PER_RUN = Number(process.env.PREWARM_MAX_VERBS || 25);
       let n = 0;
 
@@ -73,15 +74,17 @@ function startWarmWorker() {
         warmQueue.delete(verb);
         n++;
 
+        if (!supported(verb) || !enabled(verb)) continue;
+
         try {
           await getValidatorForVerb(verb);
         } catch {
-          // swallow; warm is best-effort
+          // best-effort warm
         }
       }
     } finally {
       warmRunning = false;
-      if (warmQueue.size > 0) startWarmWorker();
+      if (warmQueue.size > 0) startWarmWorker({ enabled, supported });
     }
   }, 0);
 }
@@ -104,7 +107,7 @@ export function buildApp() {
   // Identity
   const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-commercial-runtime";
   const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
-  const API_VERSION = process.env.API_VERSION || "1.0.0";
+  const API_VERSION = process.env.API_VERSION || API_VERSION_DEFAULT;
 
   // Canonical base:
   // - On Railway, RAILWAY_PUBLIC_DOMAIN is the best default
@@ -117,6 +120,7 @@ export function buildApp() {
 
   const ENABLED_VERBS = parseEnabledVerbs();
   const enabled = (verb) => ENABLED_VERBS.includes(verb);
+  const supported = (verb) => Boolean(handlers[verb]);
 
   // Receipt signer label (not the key itself)
   const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "commercial-runtime";
@@ -128,16 +132,39 @@ export function buildApp() {
     if (!enabled(verb)) {
       return res.status(404).json({ status: "error", code: 404, message: `Verb not enabled: ${verb}` });
     }
-    if (!handlers[verb]) {
+    if (!supported(verb)) {
       return res.status(404).json({ status: "error", code: 404, message: `Verb not supported: ${verb}` });
     }
     if (!requireJsonBody(req, res)) return;
 
     const started = Date.now();
 
-    // parent trace id allowed if provided (string + non-empty)
-    const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
-    const parent_trace_id = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
+    // TRACE (match Commons behavior)
+    // - receipt.trace.trace_id        = runtime execution id (minted here)
+    // - receipt.trace.parent_trace_id = upstream/workflow trace id (if provided)
+    //
+    // Accept inbound workflow trace id from:
+    //   - req.body.trace.trace_id (preferred)
+    //   - req.body.trace_id (legacy)
+    //
+    // Accept explicit parent_trace_id from:
+    //   - req.body.trace.parent_trace_id
+    //   - req.body.x402.extras.parent_trace_id (legacy hook)
+    const inboundTrace =
+      typeof req.body?.trace?.trace_id === "string" && req.body.trace.trace_id.trim().length
+        ? req.body.trace.trace_id.trim()
+        : typeof req.body?.trace_id === "string" && req.body.trace_id.trim().length
+        ? req.body.trace_id.trim()
+        : null;
+
+    const explicitParent =
+      typeof req.body?.trace?.parent_trace_id === "string" && req.body.trace.parent_trace_id.trim().length
+        ? req.body.trace.parent_trace_id.trim()
+        : typeof req.body?.x402?.extras?.parent_trace_id === "string" && req.body.x402.extras.parent_trace_id.trim().length
+        ? req.body.x402.extras.parent_trace_id.trim()
+        : null;
+
+    const parent_trace_id = explicitParent || inboundTrace || null;
 
     const trace = {
       trace_id: randId("trace_"),
@@ -151,8 +178,8 @@ export function buildApp() {
     // Default x402 if caller omitted
     const x402 = req.body?.x402 || {
       verb,
-      version: "1.0.0",
-      entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
+      version: API_VERSION,
+      entry: `x402://${verb}agent.eth/${verb}/v${API_VERSION}`,
     };
 
     try {
@@ -161,7 +188,7 @@ export function buildApp() {
       // Decide free vs paid + enforce limits
       const decision = await applyLimits({ req, verb, pricing, actor });
 
-      // Execute verb deterministically (your verb modules can call Stripe/crypto later)
+      // Execute verb deterministically (verb modules can call Stripe/crypto later)
       const result = await handlers[verb]({ body: req.body, actor, pricing, decision });
 
       trace.completed_at = nowIso();
@@ -286,25 +313,25 @@ export function buildApp() {
   app.post("/debug/prewarm", async (req, res) => {
     const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs : [];
     const cleaned = verbs.map((v) => String(v || "").trim()).filter(Boolean);
-    const supported = cleaned.filter((v) => enabled(v));
+    const queued = cleaned.filter((v) => enabled(v) && supported(v));
 
-    for (const v of supported) warmQueue.add(v);
+    for (const v of queued) warmQueue.add(v);
 
     res.json({
       ok: true,
-      queued: supported,
+      queued,
       queue_size: warmQueue.size,
       note: "Warm runs after response; poll /debug/validators.",
     });
 
-    startWarmWorker();
+    startWarmWorker({ enabled, supported });
   });
 
   // -----------------------
   // Verb routes
   // -----------------------
   for (const v of Object.keys(handlers)) {
-    app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
+    app.post(`/${v}/v${API_VERSION}`, (req, res) => handleVerb(v, req, res));
   }
 
   // -----------------------
@@ -332,6 +359,8 @@ export function buildApp() {
 
         if (!verb) {
           schemaErrors = [{ message: "missing receipt.x402.verb" }];
+        } else if (!enabled(verb) || !supported(verb)) {
+          schemaErrors = [{ message: "verb_not_supported_by_this_runtime" }];
         } else {
           try {
             const validate = await getValidatorForVerb(verb);
@@ -377,7 +406,7 @@ export function buildApp() {
 export function start() {
   const { app, PORT } = buildApp();
 
-  // IMPORTANT: Railway needs 0.0.0.0 binding
+  // Railway needs 0.0.0.0 binding
   const host = process.env.HOST || "0.0.0.0";
 
   console.log("boot: commandlayer-commercial-runtime");
@@ -389,7 +418,7 @@ export function start() {
   return server;
 }
 
-// If run directly: node src/server.mjs
-if (import.meta.url === new URL(process.argv[1], "file:").href) {
+// If run directly: node src/commercial.server.mjs
+if (import.meta.url === new URL(`file:${process.argv[1]}`).href) {
   start();
 }
