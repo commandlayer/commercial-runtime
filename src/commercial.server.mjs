@@ -2,8 +2,7 @@
 // CommandLayer — Commercial Runtime
 // Verbs: authorize, checkout, purchase, ship, verify
 //
-// Start (local):  PORT=8090 node src/commercial.server.mjs
-// Package script: "start": "node src/commercial.server.mjs"
+// Start: PORT=8090 node src/commercial.server.mjs
 
 import express from "express";
 import crypto from "crypto";
@@ -26,8 +25,6 @@ const handlers = {
   ship,
   verify: verifyVerb,
 };
-
-const API_VERSION_DEFAULT = "1.0.0";
 
 function nowIso() {
   return new Date().toISOString();
@@ -52,13 +49,29 @@ function requireJsonBody(req, res) {
   return true;
 }
 
+function safeJson(res, http, payload) {
+  try {
+    return res.status(http).json(payload);
+  } catch {
+    return res.status(http).end(JSON.stringify(payload));
+  }
+}
+
+function safeMakeReceipt(args) {
+  try {
+    return { ok: true, receipt: makeReceipt(args) };
+  } catch (e) {
+    return { ok: false, error: e };
+  }
+}
+
 // -----------------------
 // Optional: schema warm queue (edge-safe-ish)
 // -----------------------
 const warmQueue = new Set();
 let warmRunning = false;
 
-function startWarmWorker({ enabled, supported }) {
+function startWarmWorker() {
   if (warmRunning) return;
   warmRunning = true;
 
@@ -74,8 +87,6 @@ function startWarmWorker({ enabled, supported }) {
         warmQueue.delete(verb);
         n++;
 
-        if (!supported(verb) || !enabled(verb)) continue;
-
         try {
           await getValidatorForVerb(verb);
         } catch {
@@ -84,7 +95,7 @@ function startWarmWorker({ enabled, supported }) {
       }
     } finally {
       warmRunning = false;
-      if (warmQueue.size > 0) startWarmWorker({ enabled, supported });
+      if (warmQueue.size > 0) startWarmWorker();
     }
   }, 0);
 }
@@ -93,7 +104,7 @@ export function buildApp() {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
 
-  // CORS (no dependency)
+  // ---- basic CORS (no dependency)
   app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -104,10 +115,10 @@ export function buildApp() {
 
   const PORT = Number(process.env.PORT || 8080);
 
-  // Identity
+  // ---- service identity / discovery
   const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-commercial-runtime";
   const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
-  const API_VERSION = process.env.API_VERSION || API_VERSION_DEFAULT;
+  const API_VERSION = process.env.API_VERSION || "1.0.0";
 
   // Canonical base:
   // - On Railway, RAILWAY_PUBLIC_DOMAIN is the best default
@@ -118,9 +129,9 @@ export function buildApp() {
     ""
   );
 
+  // ---- runtime config
   const ENABLED_VERBS = parseEnabledVerbs();
   const enabled = (verb) => ENABLED_VERBS.includes(verb);
-  const supported = (verb) => Boolean(handlers[verb]);
 
   // Receipt signer label (not the key itself)
   const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "commercial-runtime";
@@ -132,39 +143,16 @@ export function buildApp() {
     if (!enabled(verb)) {
       return res.status(404).json({ status: "error", code: 404, message: `Verb not enabled: ${verb}` });
     }
-    if (!supported(verb)) {
+    if (!handlers[verb]) {
       return res.status(404).json({ status: "error", code: 404, message: `Verb not supported: ${verb}` });
     }
     if (!requireJsonBody(req, res)) return;
 
     const started = Date.now();
 
-    // TRACE (match Commons behavior)
-    // - receipt.trace.trace_id        = runtime execution id (minted here)
-    // - receipt.trace.parent_trace_id = upstream/workflow trace id (if provided)
-    //
-    // Accept inbound workflow trace id from:
-    //   - req.body.trace.trace_id (preferred)
-    //   - req.body.trace_id (legacy)
-    //
-    // Accept explicit parent_trace_id from:
-    //   - req.body.trace.parent_trace_id
-    //   - req.body.x402.extras.parent_trace_id (legacy hook)
-    const inboundTrace =
-      typeof req.body?.trace?.trace_id === "string" && req.body.trace.trace_id.trim().length
-        ? req.body.trace.trace_id.trim()
-        : typeof req.body?.trace_id === "string" && req.body.trace_id.trim().length
-        ? req.body.trace_id.trim()
-        : null;
-
-    const explicitParent =
-      typeof req.body?.trace?.parent_trace_id === "string" && req.body.trace.parent_trace_id.trim().length
-        ? req.body.trace.parent_trace_id.trim()
-        : typeof req.body?.x402?.extras?.parent_trace_id === "string" && req.body.x402.extras.parent_trace_id.trim().length
-        ? req.body.x402.extras.parent_trace_id.trim()
-        : null;
-
-    const parent_trace_id = explicitParent || inboundTrace || null;
+    // parent trace id allowed if provided (string + non-empty)
+    const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
+    const parent_trace_id = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
 
     const trace = {
       trace_id: randId("trace_"),
@@ -178,23 +166,24 @@ export function buildApp() {
     // Default x402 if caller omitted
     const x402 = req.body?.x402 || {
       verb,
-      version: API_VERSION,
-      entry: `x402://${verb}agent.eth/${verb}/v${API_VERSION}`,
+      version: "1.0.0",
+      entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
     };
 
-    try {
-      const actor = resolveActor(req);
+    // Resolve actor once; reuse on both success/error
+    const actor = resolveActor(req);
 
+    try {
       // Decide free vs paid + enforce limits
       const decision = await applyLimits({ req, verb, pricing, actor });
 
-      // Execute verb deterministically (verb modules can call Stripe/crypto later)
+      // Execute verb deterministically (your verb modules can call Stripe/crypto later)
       const result = await handlers[verb]({ body: req.body, actor, pricing, decision });
 
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
 
-      const receipt = makeReceipt({
+      const out = safeMakeReceipt({
         signer_id: SIGNER_ID,
         x402,
         trace,
@@ -214,12 +203,21 @@ export function buildApp() {
         },
       });
 
-      return res.json(receipt);
+      if (!out.ok) {
+        console.error("receipt_sign_failed(success):", out.error?.stack || out.error);
+        return safeJson(res, 500, {
+          status: "error",
+          code: 500,
+          message: "receipt signing failed",
+          details: { verb, where: "success" },
+          time: nowIso(),
+        });
+      }
+
+      return res.json(out.receipt);
     } catch (e) {
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
-
-      const actor = resolveActor(req);
 
       const err = {
         code: String(e?.code || "INTERNAL_ERROR"),
@@ -228,7 +226,7 @@ export function buildApp() {
         details: { verb },
       };
 
-      const receipt = makeReceipt({
+      const out = safeMakeReceipt({
         signer_id: SIGNER_ID,
         x402,
         trace,
@@ -241,7 +239,20 @@ export function buildApp() {
       });
 
       const http = Number(e?.http_status || 500);
-      return res.status(http).json(receipt);
+
+      if (!out.ok) {
+        console.error("receipt_sign_failed(error):", out.error?.stack || out.error);
+        return safeJson(res, http, {
+          status: "error",
+          code: http,
+          message: err.message,
+          details: err.details,
+          note: "also failed to sign receipt",
+          time: nowIso(),
+        });
+      }
+
+      return res.status(http).json(out.receipt);
     }
   }
 
@@ -313,25 +324,25 @@ export function buildApp() {
   app.post("/debug/prewarm", async (req, res) => {
     const verbs = Array.isArray(req.body?.verbs) ? req.body.verbs : [];
     const cleaned = verbs.map((v) => String(v || "").trim()).filter(Boolean);
-    const queued = cleaned.filter((v) => enabled(v) && supported(v));
+    const supported = cleaned.filter((v) => enabled(v));
 
-    for (const v of queued) warmQueue.add(v);
+    for (const v of supported) warmQueue.add(v);
 
     res.json({
       ok: true,
-      queued,
+      queued: supported,
       queue_size: warmQueue.size,
       note: "Warm runs after response; poll /debug/validators.",
     });
 
-    startWarmWorker({ enabled, supported });
+    startWarmWorker();
   });
 
   // -----------------------
   // Verb routes
   // -----------------------
   for (const v of Object.keys(handlers)) {
-    app.post(`/${v}/v${API_VERSION}`, (req, res) => handleVerb(v, req, res));
+    app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
   }
 
   // -----------------------
@@ -359,8 +370,6 @@ export function buildApp() {
 
         if (!verb) {
           schemaErrors = [{ message: "missing receipt.x402.verb" }];
-        } else if (!enabled(verb) || !supported(verb)) {
-          schemaErrors = [{ message: "verb_not_supported_by_this_runtime" }];
         } else {
           try {
             const validate = await getValidatorForVerb(verb);
@@ -406,7 +415,7 @@ export function buildApp() {
 export function start() {
   const { app, PORT } = buildApp();
 
-  // Railway needs 0.0.0.0 binding
+  // IMPORTANT: Railway needs 0.0.0.0 binding
   const host = process.env.HOST || "0.0.0.0";
 
   console.log("boot: commandlayer-commercial-runtime");
@@ -419,6 +428,6 @@ export function start() {
 }
 
 // If run directly: node src/commercial.server.mjs
-if (import.meta.url === new URL(`file:${process.argv[1]}`).href) {
+if (import.meta.url === new URL(process.argv[1], "file:").href) {
   start();
 }
