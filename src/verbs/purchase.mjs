@@ -1,7 +1,7 @@
 import { crockford26 } from "../util/crockford-id.mjs";
 
 export default async function purchase({ body } = {}) {
-  const input = body?.input || {};
+  const input = body?.payload ?? body?.input ?? {};
   return {
     purchase_id: crockford26(),
     status: "success",
