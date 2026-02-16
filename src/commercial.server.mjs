@@ -8,7 +8,10 @@
 import express from "express";
 import crypto from "crypto";
 
-import { makeReceipt } from "./receipts/sign.mjs";
+import { buildUnsignedReceipt, makeReceipt, signUnsignedReceipt } from "./receipts/sign.mjs";
+import { ajvErrorsToSimple, getValidatorForVerb } from "./receipts/schema.mjs";
+import { formatAjvErrors, getRequestValidator } from "./requests/schema.mjs";
+import { normalizeProtocolRequest } from "./requests/normalize.mjs";
 import { loadPricing } from "./billing/facilitator.mjs";
 import { applyLimits } from "./middleware/limits.mjs";
 import { resolveActor } from "./middleware/auth.mjs";
@@ -83,32 +86,52 @@ function safeTail(s, n = 24) {
   return String(s || "").slice(-n);
 }
 
-// IMPORTANT: never let receipt signing failures prevent an HTTP response.
-// This converts signing problems into a normal JSON error you can see.
-function safeMakeReceipt(args) {
+async function buildValidateSignReceipt({ verb, signer_id, x402, trace, result, status = "success", error = null, actor = null, metadata_patch = null } = {}) {
+  const unsigned = buildUnsignedReceipt({ signer_id, x402, trace, result, status, error, actor, metadata_patch });
+  let validate;
   try {
-    return makeReceipt(args);
+    validate = await getValidatorForVerb(verb);
   } catch (e) {
     return {
-      status: "error",
-      x402: args?.x402 || null,
-      trace: args?.trace || null,
-      error: {
-        code: "RECEIPT_SIGNING_FAILED",
-        message: String(e?.message || e).slice(0, 2048),
-        retryable: false,
-        details: { signer_id: args?.signer_id || null },
+      ok: false,
+      http_status: 500,
+      body: {
+        ok: false,
+        error: "receipt_schema_invalid",
+        kind: "receipt",
+        verb,
+        message: "Failed to load receipt schema validator",
+        details: [{ message: String(e?.message || e) }],
       },
-      actor: args?.actor || null,
-      metadata: {
-        proof: {
-          alg: "ed25519-sha256",
-          canonical: "json-stringify",
-          signer_id: args?.signer_id || null,
-          hash_sha256: null,
-          signature_b64: null,
-        },
-        receipt_id: null,
+    };
+  }
+
+  const ok = validate(unsigned);
+  if (!ok) {
+    return {
+      ok: false,
+      http_status: 500,
+      body: {
+        ok: false,
+        error: "receipt_schema_invalid",
+        kind: "receipt",
+        verb,
+        details: ajvErrorsToSimple(validate.errors) || [],
+      },
+    };
+  }
+
+  try {
+    return { ok: true, body: signUnsignedReceipt(unsigned) };
+  } catch (e) {
+    return {
+      ok: false,
+      http_status: 500,
+      body: {
+        ok: false,
+        error: "receipt_signing_failed",
+        verb,
+        message: String(e?.message || e).slice(0, 2048),
       },
     };
   }
@@ -250,12 +273,51 @@ export function buildApp() {
       provider: process.env.RAILWAY_SERVICE_NAME || "commercial-runtime",
     };
 
-    // Default x402 if caller omitted
-    const x402 = req.body?.x402 || {
-      verb,
-      version: "1.0.0",
-      entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
-    };
+    const normalized = normalizeProtocolRequest(req.body);
+    const missing = ["x402", "trace", "payload"].filter((k) => normalized[k] == null);
+    if (missing.length) {
+      respondNoStore(res);
+      return res.status(400).end(
+        JSON.stringify({
+          ok: false,
+          error: "invalid_request",
+          message: "Request must include x402, trace, and payload",
+          missing,
+        })
+      );
+    }
+
+    let validateReq;
+    try {
+      validateReq = await getRequestValidator(verb);
+    } catch (e) {
+      respondNoStore(res);
+      return res.status(500).end(
+        JSON.stringify({
+          ok: false,
+          error: "request_schema_unavailable",
+          kind: "request",
+          verb,
+          details: [{ message: String(e?.message || e) }],
+        })
+      );
+    }
+
+    const reqSchemaOk = validateReq(normalized);
+    if (!reqSchemaOk) {
+      respondNoStore(res);
+      return res.status(400).end(
+        JSON.stringify({
+          ok: false,
+          error: "schema_validation_failed",
+          kind: "request",
+          verb,
+          details: formatAjvErrors(validateReq.errors),
+        })
+      );
+    }
+
+    const x402 = normalized.x402;
 
     try {
       const actor = resolveActor(req);
@@ -264,12 +326,13 @@ export function buildApp() {
       const decision = await applyLimits({ req, verb, pricing, actor });
 
       // Execute verb deterministically (verb modules may call Stripe/crypto later)
-      const result = await handlers[verb]({ body: req.body, actor, pricing, decision });
+      const result = await handlers[verb]({ body: normalized, actor, pricing, decision });
 
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
 
-      const receipt = safeMakeReceipt({
+      const receiptOut = await buildValidateSignReceipt({
+        verb,
         signer_id: SIGNER_ID,
         x402,
         trace,
@@ -290,7 +353,7 @@ export function buildApp() {
       });
 
       respondNoStore(res);
-      return res.status(200).end(JSON.stringify(receipt));
+      return res.status(receiptOut.ok ? 200 : receiptOut.http_status || 500).end(JSON.stringify(receiptOut.body));
     } catch (e) {
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
@@ -298,7 +361,8 @@ export function buildApp() {
       const actor = resolveActor(req);
       const err = safeErrObj(e, verb);
 
-      const receipt = safeMakeReceipt({
+      const receiptOut = await buildValidateSignReceipt({
+        verb,
         signer_id: SIGNER_ID,
         x402,
         trace,
@@ -310,9 +374,9 @@ export function buildApp() {
         },
       });
 
-      const http = Number(e?.http_status || e?.status || 500);
+      const http = receiptOut.ok ? Number(e?.http_status || e?.status || 500) : receiptOut.http_status || 500;
       respondNoStore(res);
-      return res.status(http).end(JSON.stringify(receipt));
+      return res.status(http).end(JSON.stringify(receiptOut.body));
     }
   }
 
@@ -534,7 +598,6 @@ export function buildApp() {
 
       if (wantSchema) {
         schemaOk = false;
-        const { getValidatorForVerb, ajvErrorsToSimple } = await import("./receipts/schema.mjs");
         const verb = String(receipt?.x402?.verb || "").trim();
 
         if (!verb) {
