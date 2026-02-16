@@ -1,5 +1,5 @@
 export default async function ship({ body } = {}) {
-  const input = body?.input || {};
+  const input = body?.payload ?? body?.input ?? {};
   return {
     shipment_id: input.shipment_id || "ship_" + String(Date.now()),
     shipment_group_id: input.shipment_group_id || undefined,

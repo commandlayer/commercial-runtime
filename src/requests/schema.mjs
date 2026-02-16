@@ -5,19 +5,14 @@ const SCHEMA_HOST = (process.env.SCHEMA_HOST || "https://www.commandlayer.org").
 const FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 15000);
 const COMPILE_TIMEOUT_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 15000);
 
-const schemaCache = new Map(); // url -> { t, json }
-const validatorCache = new Map(); // verb -> validate
+const schemaCache = new Map();
+const validatorCache = new Map();
 
 function normalizeUrl(url) {
   let u = String(url || "");
-
-  // force https
   u = u.replace(/^http:\/\//i, "https://");
-
-  // unify host (avoid redirects / host mismatch across $id and refs)
   u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   u = u.replace(/^https:\/\/www\.commandlayer\.org\/+/, "https://www.commandlayer.org/");
-
   return u;
 }
 
@@ -36,7 +31,6 @@ async function fetchJson(url) {
 
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
-
   try {
     const resp = await fetch(u, {
       method: "GET",
@@ -45,7 +39,6 @@ async function fetchJson(url) {
       redirect: "follow",
     });
     if (!resp.ok) throw new Error(`schema fetch failed: ${resp.status} ${resp.statusText}`);
-
     const json = await resp.json();
     schemaCache.set(u, { t: Date.now(), json });
     return json;
@@ -65,15 +58,13 @@ function makeAjv() {
   return ajv;
 }
 
-export function receiptSchemaUrlForVerb(verb) {
-  return `${SCHEMA_HOST}/schemas/v1.0.0/commercial/${verb}/receipts/${verb}.receipt.schema.json`;
+export function requestSchemaUrlForVerb(verb) {
+  return `${SCHEMA_HOST}/schemas/v1.0.0/commercial/${verb}/requests/${verb}.request.schema.json`;
 }
 
 async function preloadSharedSchemas() {
   const shared = [
-    `${SCHEMA_HOST}/schemas/v1.0.0/_shared/receipt.base.schema.json`,
     `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
-    `${SCHEMA_HOST}/schemas/v1.0.0/_shared/identity.schema.json`,
     `${SCHEMA_HOST}/schemas/v1.0.0/_shared/trace.schema.json`,
     `${SCHEMA_HOST}/schemas/v1.0.0/commercial/_shared/payment.amount.schema.json`,
     `${SCHEMA_HOST}/schemas/v1.0.0/commercial/_shared/payment.settlement.schema.json`,
@@ -81,36 +72,25 @@ async function preloadSharedSchemas() {
   await Promise.all(shared.map((u) => fetchJson(u).catch(() => null)));
 }
 
-export async function getValidatorForVerb(verb) {
+export async function getRequestValidator(verb) {
   if (!verb) throw new Error("missing verb");
   if (validatorCache.has(verb)) return validatorCache.get(verb);
 
   const ajv = makeAjv();
-
   await preloadSharedSchemas();
-
-  const schema = await fetchJson(receiptSchemaUrlForVerb(verb));
+  const schema = await fetchJson(requestSchemaUrlForVerb(verb));
   const validate = await withTimeout(ajv.compileAsync(schema), COMPILE_TIMEOUT_MS, "ajv_compile_timeout");
-
   validatorCache.set(verb, validate);
   return validate;
 }
 
-export function ajvErrorsToSimple(errors) {
-  if (!Array.isArray(errors)) return null;
-  return errors.slice(0, 25).map((e) => ({
+export function formatAjvErrors(errors) {
+  if (!Array.isArray(errors)) return [];
+  return errors.slice(0, 50).map((e) => ({
     instancePath: e.instancePath,
     schemaPath: e.schemaPath,
     keyword: e.keyword,
     message: e.message,
     params: e.params,
   }));
-}
-
-export function debugState() {
-  return {
-    schema_host: SCHEMA_HOST,
-    cached_validators: Array.from(validatorCache.keys()),
-    cached_schemas: schemaCache.size,
-  };
 }
