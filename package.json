@@ -12,7 +12,8 @@
   "scripts": {
     "start": "node src/commercial.server.mjs",
     "dev": "node --watch src/commercial.server.mjs",
-    "lint": "node -e \"console.log('lint placeholder')\""
+    "lint": "node -e \"console.log('lint placeholder')\"",
+    "contract-check": "node scripts/contract-check.mjs"
   },
   "dependencies": {
     "ajv": "^8.17.1",
