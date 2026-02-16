@@ -38,7 +38,21 @@ function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
 }
 
 export function makeReceipt({ signer_id, x402, trace, result, status = "success", error = null, actor = null, metadata_patch = null } = {}) {
-  const receipt = {
+  const unsigned = buildUnsignedReceipt({ signer_id, x402, trace, result, status, error, actor, metadata_patch });
+  return signUnsignedReceipt(unsigned);
+}
+
+export function buildUnsignedReceipt({
+  signer_id,
+  x402,
+  trace,
+  result,
+  status = "success",
+  error = null,
+  actor = null,
+  metadata_patch = null,
+} = {}) {
+  return {
     status,
     x402,
     trace,
@@ -57,11 +71,16 @@ export function makeReceipt({ signer_id, x402, trace, result, status = "success"
       receipt_id: "",
     },
   };
+}
 
-  const unsigned = structuredClone(receipt);
+export function signUnsignedReceipt(unsignedReceipt) {
+  const receipt = structuredClone(unsignedReceipt);
+  const unsigned = structuredClone(unsignedReceipt);
+
+  if (!unsigned?.metadata?.proof) throw new Error("unsigned receipt missing metadata.proof");
   unsigned.metadata.proof.hash_sha256 = "";
   unsigned.metadata.proof.signature_b64 = "";
-  unsigned.metadata.receipt_id = "";
+  if (unsigned?.metadata) unsigned.metadata.receipt_id = "";
 
   const canonical = stableStringify(unsigned);
   const hash = sha256Hex(canonical);
@@ -91,12 +110,14 @@ makeReceipt.verify = async function verify({ receipt, wantEns = false, refresh =
   let pubPem = pemFromB64(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "");
   let pubSrc = pubPem ? "env-b64" : null;
 
+  let ensMeta = null;
   if (wantEns) {
-    const { fetchEnsPubkeyPem } = await import("./ens.mjs");
-    const ensOut = await fetchEnsPubkeyPem({ refresh });
+    const { fetchEnsSignerInfo } = await import("./ens.mjs");
+    const ensOut = await fetchEnsSignerInfo({ refresh });
     if (ensOut.ok && ensOut.pem) {
       pubPem = ensOut.pem;
-      pubSrc = "ens";
+      pubSrc = `ens:${ensOut.pubkey_source || "unknown"}`;
+      ensMeta = ensOut;
     }
   }
 
@@ -119,11 +140,52 @@ makeReceipt.verify = async function verify({ receipt, wantEns = false, refresh =
     sigErr = e?.message || "signature verify failed";
   }
 
+  let canonicalOk = true;
+  let canonicalErr = null;
+  if (ensMeta?.canonical) {
+    canonicalOk = String(proof?.canonical || "") === String(ensMeta.canonical);
+    if (!canonicalOk) canonicalErr = `canonical mismatch: receipt=${proof?.canonical || null} ens=${ensMeta.canonical}`;
+  }
+
+  let signerIdOk = true;
+  let signerIdErr = null;
+  if (ensMeta?.signer_id) {
+    signerIdOk = String(proof?.signer_id || "") === String(ensMeta.signer_id);
+    if (!signerIdOk) signerIdErr = `signer_id mismatch: receipt=${proof?.signer_id || null} ens=${ensMeta.signer_id}`;
+  }
+
+  let kidOk = true;
+  let kidErr = null;
+  if (ensMeta?.kid && proof?.kid) {
+    kidOk = String(proof.kid) === String(ensMeta.kid);
+    if (!kidOk) kidErr = `kid mismatch: receipt=${proof.kid} ens=${ensMeta.kid}`;
+  }
+
+  const allOk = hashMatches && sigOk && canonicalOk && signerIdOk && kidOk;
+
   return {
-    ok: hashMatches && sigOk,
-    http_status: hashMatches && sigOk ? 200 : 400,
-    checks: { hash_matches: hashMatches, signature_valid: sigOk },
-    values: { recomputed_hash: recomputed, pubkey_source: pubSrc },
-    errors: { signature_error: sigErr },
+    ok: allOk,
+    http_status: allOk ? 200 : 400,
+    checks: {
+      hash_matches: hashMatches,
+      signature_valid: sigOk,
+      canonical_valid: canonicalOk,
+      signer_id_valid: signerIdOk,
+      kid_valid: kidOk,
+    },
+    values: {
+      recomputed_hash: recomputed,
+      pubkey_source: pubSrc,
+      ens_signer_id: ensMeta?.signer_id || null,
+      ens_canonical: ensMeta?.canonical || null,
+      ens_kid: ensMeta?.kid || null,
+    },
+    errors: {
+      signature_error: sigErr,
+      canonical_error: canonicalErr,
+      signer_id_error: signerIdErr,
+      kid_error: kidErr,
+      ens_error: wantEns && !ensMeta ? "ens key unavailable" : null,
+    },
   };
 };

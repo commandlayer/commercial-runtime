@@ -1,7 +1,7 @@
 import { crockford26 } from "../util/crockford-id.mjs";
 
 export default async function authorize({ body } = {}) {
-  const input = body?.input || {};
+  const input = body?.payload ?? body?.input ?? {};
   const status = "authorized";
   return {
     authorization_id: crockford26(),
