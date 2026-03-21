@@ -1,16 +1,20 @@
+import { API_VERSION_DEFAULT } from "../runtime-version.mjs";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
 
 const SCHEMA_HOST = (process.env.SCHEMA_HOST || "https://www.commandlayer.org").replace(/\/+$/, "");
 const FETCH_TIMEOUT_MS = Number(process.env.SCHEMA_FETCH_TIMEOUT_MS || 15000);
 const COMPILE_TIMEOUT_MS = Number(process.env.SCHEMA_VALIDATE_BUDGET_MS || 15000);
+const SCHEMA_VERSION = process.env.SCHEMA_VERSION || API_VERSION_DEFAULT;
 
 const schemaCache = new Map();
 const validatorCache = new Map();
 
 function normalizeUrl(url) {
   let u = String(url || "");
-  u = u.replace(/^http:\/\//i, "https://");
+  if (!/^http:\/\/127\.0\.0\.1(?::\d+)?\//i.test(u) && !/^http:\/\/localhost(?::\d+)?\//i.test(u)) {
+    u = u.replace(/^http:\/\//i, "https://");
+  }
   u = u.replace(/^https:\/\/commandlayer\.org/i, "https://www.commandlayer.org");
   u = u.replace(/^https:\/\/www\.commandlayer\.org\/+/, "https://www.commandlayer.org/");
   return u;
@@ -59,15 +63,15 @@ function makeAjv() {
 }
 
 export function requestSchemaUrlForVerb(verb) {
-  return `${SCHEMA_HOST}/schemas/v1.0.0/commercial/${verb}/requests/${verb}.request.schema.json`;
+  return `${SCHEMA_HOST}/schemas/v${SCHEMA_VERSION}/commercial/${verb}/requests/${verb}.request.schema.json`;
 }
 
 async function preloadSharedSchemas() {
   const shared = [
-    `${SCHEMA_HOST}/schemas/v1.0.0/_shared/x402.schema.json`,
-    `${SCHEMA_HOST}/schemas/v1.0.0/_shared/trace.schema.json`,
-    `${SCHEMA_HOST}/schemas/v1.0.0/commercial/_shared/payment.amount.schema.json`,
-    `${SCHEMA_HOST}/schemas/v1.0.0/commercial/_shared/payment.settlement.schema.json`,
+    `${SCHEMA_HOST}/schemas/v${SCHEMA_VERSION}/_shared/x402.schema.json`,
+    `${SCHEMA_HOST}/schemas/v${SCHEMA_VERSION}/_shared/trace.schema.json`,
+    `${SCHEMA_HOST}/schemas/v${SCHEMA_VERSION}/commercial/_shared/payment.amount.schema.json`,
+    `${SCHEMA_HOST}/schemas/v${SCHEMA_VERSION}/commercial/_shared/payment.settlement.schema.json`,
   ];
   await Promise.all(shared.map((u) => fetchJson(u).catch(() => null)));
 }
