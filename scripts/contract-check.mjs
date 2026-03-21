@@ -7,6 +7,8 @@ const BASE = process.env.CONTRACT_CHECK_BASE_URL || `http://127.0.0.1:${PORT}`;
 const SCHEMA_HOST = (process.env.SCHEMA_HOST || "https://www.commandlayer.org").replace(/\/+$/, "");
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_EXAMPLE_BYTES = 200_000;
+const API_VERSION = process.env.API_VERSION || "1.1.0";
+const SCHEMA_VERSION = process.env.SCHEMA_VERSION || API_VERSION;
 
 function parseArg(name) {
   const i = process.argv.indexOf(name);
@@ -78,7 +80,7 @@ function simplifyErrors(errors) {
 }
 
 function schemaUrl(verb, kind) {
-  return `${SCHEMA_HOST}/schemas/v1.0.0/commercial/${verb}/${kind}/${verb}.${kind.slice(0, -1)}.schema.json`;
+  return `${SCHEMA_HOST}/schemas/v${SCHEMA_VERSION}/commercial/${verb}/${kind}/${verb}.${kind.slice(0, -1)}.schema.json`;
 }
 
 async function makeAjv(fetchJson) {
@@ -246,7 +248,7 @@ async function runChild(verb) {
   }
 
   console.log(`POST ${verb}`);
-  const resp = await fetch(`${BASE}/${verb}/v1.0.0`, {
+  const resp = await fetch(`${BASE}/${verb}/v${API_VERSION}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(requestBody),
@@ -400,8 +402,8 @@ async function main() {
       const requestBody = {
         x402: {
           verb,
-          version: "1.0.0",
-          entry: `x402://${verb}agent.eth/${verb}/v1.0.0`,
+          version: API_VERSION,
+          entry: `x402://${verb}agent.eth/${verb}/v${API_VERSION}`,
         },
         trace: {
           trace_id: `trace_contract_${verb}`,
@@ -420,7 +422,7 @@ async function main() {
         );
       }
 
-      const resp = await fetch(`${BASE}/${verb}/v1.0.0`, {
+      const resp = await fetch(`${BASE}/${verb}/v${API_VERSION}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(requestBody),

@@ -12,6 +12,7 @@ import { buildUnsignedReceipt, makeReceipt, signUnsignedReceipt } from "./receip
 import { ajvErrorsToSimple, getValidatorForVerb } from "./receipts/schema.mjs";
 import { formatAjvErrors, getRequestValidator } from "./requests/schema.mjs";
 import { normalizeProtocolRequest } from "./requests/normalize.mjs";
+import { API_VERSION_DEFAULT, SERVICE_VERSION_DEFAULT } from "./runtime-version.mjs";
 import { loadPricing } from "./billing/facilitator.mjs";
 import { applyLimits } from "./middleware/limits.mjs";
 import { resolveActor } from "./middleware/auth.mjs";
@@ -226,8 +227,8 @@ export function buildApp() {
 
   // Identity
   const SERVICE_NAME = process.env.SERVICE_NAME || "commandlayer-commercial-runtime";
-  const SERVICE_VERSION = process.env.SERVICE_VERSION || "1.0.0";
-  const API_VERSION = process.env.API_VERSION || "1.0.0";
+  const SERVICE_VERSION = process.env.SERVICE_VERSION || SERVICE_VERSION_DEFAULT;
+  const API_VERSION = process.env.API_VERSION || API_VERSION_DEFAULT;
 
   // Canonical base:
   const railwayBase = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null;
@@ -260,20 +261,22 @@ export function buildApp() {
 
     const started = Date.now();
 
+    const normalized = normalizeProtocolRequest(req.body, { verb, apiVersion: API_VERSION });
+
     // parent trace id allowed if provided (string + non-empty)
-    const rawParent = req.body?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? null;
+    const rawParent = normalized?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? req.body?.parent_trace_id ?? req.body?.input?.parent_trace_id ?? null;
     const parent_trace_id = typeof rawParent === "string" && rawParent.trim().length ? rawParent.trim() : null;
+    const normalizedTraceId = typeof normalized?.trace?.trace_id === "string" && normalized.trace.trace_id.trim().length ? normalized.trace.trace_id.trim() : null;
 
     const trace = {
-      trace_id: randId("trace_"),
+      ...(normalized?.trace && typeof normalized.trace === "object" ? normalized.trace : {}),
+      trace_id: normalizedTraceId || randId("trace_"),
       ...(parent_trace_id ? { parent_trace_id } : {}),
       started_at: nowIso(),
       completed_at: null,
       duration_ms: null,
       provider: process.env.RAILWAY_SERVICE_NAME || "commercial-runtime",
     };
-
-    const normalized = normalizeProtocolRequest(req.body);
     const missing = ["x402", "trace", "payload"].filter((k) => normalized[k] == null);
     if (missing.length) {
       respondNoStore(res);
@@ -573,7 +576,7 @@ export function buildApp() {
   // Verb routes
   // -----------------------
   for (const v of Object.keys(handlers)) {
-    app.post(`/${v}/v1.0.0`, (req, res) => handleVerb(v, req, res));
+    app.post(`/${v}/v${API_VERSION}`, (req, res) => handleVerb(v, req, res));
   }
 
   // -----------------------
