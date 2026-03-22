@@ -1,5 +1,7 @@
 import crypto from "crypto";
 
+import { getPublicKeyObject, getPublicKeySource, pemFromB64 } from "./keys.mjs";
+
 function stableStringify(value) {
   const seen = new WeakSet();
   const helper = (v) => {
@@ -18,12 +20,6 @@ function sha256Hex(str) {
   return crypto.createHash("sha256").update(str).digest("hex");
 }
 
-function pemFromB64(b64) {
-  if (!b64) return null;
-  const pem = Buffer.from(b64, "base64").toString("utf8");
-  return pem.includes("BEGIN") ? pem : null;
-}
-
 function signEd25519Base64(messageUtf8) {
   const pem = pemFromB64(process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "");
   if (!pem) throw new Error("Missing RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64");
@@ -32,8 +28,8 @@ function signEd25519Base64(messageUtf8) {
   return sig.toString("base64");
 }
 
-function verifyEd25519Base64(messageUtf8, signatureB64, pubPem) {
-  const key = crypto.createPublicKey(pubPem);
+function verifyEd25519Base64(messageUtf8, signatureB64, publicKey) {
+  const key = publicKey;
   return crypto.verify(null, Buffer.from(messageUtf8, "utf8"), key, Buffer.from(signatureB64, "base64"));
 }
 
@@ -107,34 +103,41 @@ makeReceipt.verify = async function verify({ receipt, wantEns = false, refresh =
   const recomputed = sha256Hex(canonical);
   const hashMatches = recomputed === proof.hash_sha256;
 
-  let pubPem = pemFromB64(process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "");
-  let pubSrc = pubPem ? "env-b64" : null;
+  let envPubKey = null;
+  let pubSrc = null;
+
+  try {
+    envPubKey = getPublicKeyObject();
+    pubSrc = getPublicKeySource();
+  } catch {
+    envPubKey = null;
+  }
 
   let ensMeta = null;
   if (wantEns) {
     const { fetchEnsSignerInfo } = await import("./ens.mjs");
     const ensOut = await fetchEnsSignerInfo({ refresh });
     if (ensOut.ok && ensOut.pem) {
-      pubPem = ensOut.pem;
+      envPubKey = crypto.createPublicKey(ensOut.pem);
       pubSrc = `ens:${ensOut.pubkey_source || "unknown"}`;
       ensMeta = ensOut;
     }
   }
 
-  if (!pubPem) {
+  if (!envPubKey) {
     return {
       ok: false,
       http_status: 400,
       checks: { hash_matches: hashMatches, signature_valid: false },
       values: { recomputed_hash: recomputed, pubkey_source: pubSrc },
-      error: "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 or use ens=1)",
+      error: "no public key available (set RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64, RECEIPT_SIGNING_PUBLIC_KEY_B64, or use ens=1)",
     };
   }
 
   let sigOk = false;
   let sigErr = null;
   try {
-    sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, pubPem);
+    sigOk = verifyEd25519Base64(proof.hash_sha256, proof.signature_b64, envPubKey);
   } catch (e) {
     sigOk = false;
     sigErr = e?.message || "signature verify failed";

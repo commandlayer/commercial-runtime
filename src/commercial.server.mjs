@@ -9,6 +9,7 @@ import express from "express";
 import crypto from "crypto";
 
 import { buildUnsignedReceipt, makeReceipt, signUnsignedReceipt } from "./receipts/sign.mjs";
+import { getPublicKeyObject, getPublicKeySource, pemFromB64 } from "./receipts/keys.mjs";
 import { ajvErrorsToSimple, getValidatorForVerb } from "./receipts/schema.mjs";
 import { formatAjvErrors, getRequestValidator } from "./requests/schema.mjs";
 import { normalizeProtocolRequest } from "./requests/normalize.mjs";
@@ -67,17 +68,6 @@ function safeErrObj(e, verb) {
     retryable: Boolean(e?.retryable),
     details: { verb },
   };
-}
-
-function b64ToPem(b64) {
-  if (!b64 || typeof b64 !== "string") return null;
-  // remove whitespace/newlines just in case Railway/UI inserted them
-  const cleaned = b64.replace(/\s+/g, "");
-  if (!cleaned) return null;
-  const pem = Buffer.from(cleaned, "base64").toString("utf8");
-  const head = (pem.split("\n")[0] || "").trim();
-  if (!head.includes("BEGIN")) return null;
-  return pem;
 }
 
 function safeHead(s, n = 24) {
@@ -175,11 +165,14 @@ function startWarmWorker() {
 function keyHealth() {
   // We do NOT log the keys; just report presence + parsability.
   const privB64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
-  const pubB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+  const pubPemB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+  const pubRawB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_B64 || "";
 
   const out = {
     has_priv_b64: !!privB64,
-    has_pub_b64: !!pubB64,
+    has_pub_b64: !!(pubPemB64 || pubRawB64),
+    has_pub_pem_b64: !!pubPemB64,
+    has_pub_raw_b64: !!pubRawB64,
     priv_ok: false,
     pub_ok: false,
     error: null,
@@ -187,7 +180,7 @@ function keyHealth() {
 
   try {
     if (privB64) {
-      const pem = b64ToPem(privB64);
+      const pem = pemFromB64(privB64);
       if (!pem) throw new Error("decoded private key missing PEM header");
       crypto.createPrivateKey(pem);
       out.priv_ok = true;
@@ -197,10 +190,8 @@ function keyHealth() {
   }
 
   try {
-    if (pubB64) {
-      const pem = b64ToPem(pubB64);
-      if (!pem) throw new Error("decoded public key missing PEM header");
-      crypto.createPublicKey(pem);
+    if (pubPemB64 || pubRawB64) {
+      getPublicKeyObject();
       out.pub_ok = true;
     }
   } catch (e) {
@@ -424,7 +415,14 @@ export function buildApp() {
         enabled_verbs: ENABLED_VERBS,
         signer_id: SIGNER_ID,
         signer_ok: !!kh.priv_ok,
-        keys: { has_priv_b64: kh.has_priv_b64, has_pub_b64: kh.has_pub_b64, priv_ok: kh.priv_ok, pub_ok: kh.pub_ok },
+        keys: {
+          has_priv_b64: kh.has_priv_b64,
+          has_pub_b64: kh.has_pub_b64,
+          has_pub_pem_b64: kh.has_pub_pem_b64,
+          has_pub_raw_b64: kh.has_pub_raw_b64,
+          priv_ok: kh.priv_ok,
+          pub_ok: kh.pub_ok,
+        },
         time: nowIso(),
       })
     );
@@ -462,11 +460,12 @@ export function buildApp() {
     respondNoStore(res);
 
     const privB64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
-    const pubB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+    const pubPemB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+    const pubRawB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_B64 || "";
 
     const decodeHeader = (b64) => {
       try {
-        const pem = b64ToPem(b64);
+        const pem = pemFromB64(b64);
         if (!pem) return null;
         return (pem.split("\n")[0] || "").trim();
       } catch {
@@ -484,10 +483,14 @@ export function buildApp() {
           decoded_header: decodeHeader(privB64),
         },
         pub: {
-          b64_len: pubB64.length,
-          b64_head: safeHead(pubB64),
-          b64_tail: safeTail(pubB64),
-          decoded_header: decodeHeader(pubB64),
+          pem_b64_len: pubPemB64.length,
+          pem_b64_head: safeHead(pubPemB64),
+          pem_b64_tail: safeTail(pubPemB64),
+          decoded_header: decodeHeader(pubPemB64),
+          raw_b64_len: pubRawB64.length,
+          raw_b64_head: safeHead(pubRawB64),
+          raw_b64_tail: safeTail(pubRawB64),
+          source: getPublicKeySource(),
         },
       })
     );
@@ -501,13 +504,16 @@ export function buildApp() {
     const sha = crypto.createHash("sha256").update(msg).digest("hex");
 
     const privB64 = process.env.RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64 || "";
-    const pubB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+    const pubPemB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 || "";
+    const pubRawB64 = process.env.RECEIPT_SIGNING_PUBLIC_KEY_B64 || "";
 
     const out = {
       ok: false,
       signer_id: SIGNER_ID,
       has_priv_b64: !!privB64,
-      has_pub_b64: !!pubB64,
+      has_pub_b64: !!(pubPemB64 || pubRawB64),
+      has_pub_pem_b64: !!pubPemB64,
+      has_pub_raw_b64: !!pubRawB64,
       sign_ok: false,
       verify_ok_env_pub: false,
       error: null,
@@ -515,20 +521,19 @@ export function buildApp() {
     };
 
     try {
-      const privPem = b64ToPem(privB64);
-      const pubPem = b64ToPem(pubB64);
+      const privPem = pemFromB64(privB64);
 
       if (!privPem) throw new Error("private key decode failed (bad base64 or missing PEM header)");
-      if (!pubPem) throw new Error("public key decode failed (bad base64 or missing PEM header)");
 
       const priv = crypto.createPrivateKey(privPem);
-      const pub = crypto.createPublicKey(pubPem);
+      const pub = getPublicKeyObject();
 
       const sig = crypto.sign(null, Buffer.from(sha, "utf8"), priv);
       out.sign_ok = true;
 
       const ok = crypto.verify(null, Buffer.from(sha, "utf8"), pub, sig);
       out.verify_ok_env_pub = !!ok;
+      out.public_key_source = getPublicKeySource();
 
       out.ok = out.sign_ok && out.verify_ok_env_pub;
       return res.status(out.ok ? 200 : 500).end(JSON.stringify(out));
