@@ -260,8 +260,19 @@ export function buildApp() {
 
   async function handleVerb(verb, req, res) {
     const debug_id = randId("dbg_");
-    let stage = "entry";
-    logVerbStage({ debug_id, verb, stage: "handleVerb:entry", extra: { method: req.method, path: req.path } });
+    let stage = "handleVerb:entry";
+    let lastCompletedStage = null;
+    logVerbStage({
+      debug_id,
+      verb,
+      stage,
+      extra: {
+        method: req.method,
+        path: req.path,
+        body_keys: req.body && typeof req.body === "object" ? Object.keys(req.body).slice(0, 12) : [],
+      },
+    });
+    lastCompletedStage = stage;
 
     if (!enabled(verb)) {
       respondNoStore(res);
@@ -277,11 +288,27 @@ export function buildApp() {
 
     const started = Date.now();
 
-    stage = "normalize:before";
-    logVerbStage({ debug_id, verb, stage });
+    stage = "normalizeProtocolRequest:before";
+    logVerbStage({
+      debug_id,
+      verb,
+      stage,
+      extra: { body_keys: Object.keys(req.body || {}).slice(0, 12) },
+    });
     const normalized = normalizeProtocolRequest(req.body, { verb, apiVersion: API_VERSION });
-    stage = "normalize:after";
-    logVerbStage({ debug_id, verb, stage, extra: { has_x402: normalized?.x402 != null, has_trace: normalized?.trace != null, has_payload: normalized?.payload != null } });
+    stage = "normalizeProtocolRequest:after";
+    logVerbStage({
+      debug_id,
+      verb,
+      stage,
+      extra: {
+        normalized_keys: normalized && typeof normalized === "object" ? Object.keys(normalized).slice(0, 12) : [],
+        has_x402: normalized?.x402 != null,
+        has_trace: normalized?.trace != null,
+        has_payload: normalized?.payload != null,
+      },
+    });
+    lastCompletedStage = stage;
 
     // parent trace id allowed if provided (string + non-empty)
     const rawParent = normalized?.trace?.parent_trace_id ?? req.body?.x402?.extras?.parent_trace_id ?? req.body?.parent_trace_id ?? req.body?.input?.parent_trace_id ?? null;
@@ -313,13 +340,20 @@ export function buildApp() {
 
     let validateReq;
     try {
-      stage = "validator:before";
+      stage = "getRequestValidator:before";
       logVerbStage({ debug_id, verb, stage });
       validateReq = await getRequestValidator(verb);
-      stage = "validator:after";
+      stage = "getRequestValidator:after";
       logVerbStage({ debug_id, verb, stage });
+      lastCompletedStage = stage;
     } catch (e) {
-      logVerbStage({ debug_id, verb, stage: "catch", level: "error", extra: { failed_stage: stage, message: String(e?.message || e).slice(0, 512) } });
+      logVerbStage({
+        debug_id,
+        verb,
+        stage: "catch",
+        level: "error",
+        extra: { error_message: String(e?.message || e).slice(0, 512), last_completed_stage: lastCompletedStage, failed_stage: stage },
+      });
       respondNoStore(res);
       return res.status(500).end(
         JSON.stringify({
@@ -332,9 +366,10 @@ export function buildApp() {
       );
     }
 
-    stage = "request_validation:run";
+    stage = "requestValidation:result";
     const reqSchemaOk = validateReq(normalized);
-    logVerbStage({ debug_id, verb, stage: "request_validation:after", extra: { ok: reqSchemaOk, error_count: Array.isArray(validateReq.errors) ? validateReq.errors.length : 0 } });
+    logVerbStage({ debug_id, verb, stage, extra: { ok: reqSchemaOk, error_count: Array.isArray(validateReq.errors) ? validateReq.errors.length : 0 } });
+    lastCompletedStage = stage;
     if (!reqSchemaOk) {
       respondNoStore(res);
       return res.status(400).end(
@@ -351,24 +386,26 @@ export function buildApp() {
     const x402 = normalized.x402;
 
     try {
-      stage = "resolve_actor:before";
+      stage = "resolveActor:before";
       logVerbStage({ debug_id, verb, stage });
       const actor = resolveActor(req);
-      stage = "resolve_actor:after";
+      stage = "resolveActor:after";
       logVerbStage({ debug_id, verb, stage, extra: { actor_present: actor != null } });
+      lastCompletedStage = stage;
 
       // Decide free vs paid + enforce limits
-      stage = "apply_limits:before";
+      stage = "applyLimits:before";
       logVerbStage({ debug_id, verb, stage });
-      const stopApplyLimitsGuard = startStageGuard({ debug_id, verb, stage: "apply_limits" });
+      const stopApplyLimitsGuard = startStageGuard({ debug_id, verb, stage: "applyLimits" });
       let decision;
       try {
         decision = await applyLimits({ req, verb, pricing, actor });
       } finally {
         stopApplyLimitsGuard();
       }
-      stage = "apply_limits:after";
+      stage = "applyLimits:after";
       logVerbStage({ debug_id, verb, stage, extra: { paid: Boolean(decision?.paid) } });
+      lastCompletedStage = stage;
 
       // Execute verb deterministically (verb modules may call Stripe/crypto later)
       stage = "handler:before";
@@ -382,11 +419,12 @@ export function buildApp() {
       }
       stage = "handler:after";
       logVerbStage({ debug_id, verb, stage });
+      lastCompletedStage = stage;
 
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
 
-      stage = "receipt:before";
+      stage = "buildValidateSignReceipt:before";
       logVerbStage({ debug_id, verb, stage, extra: { duration_ms: trace.duration_ms } });
       const receiptOut = await buildValidateSignReceipt({
         verb,
@@ -408,18 +446,31 @@ export function buildApp() {
           limits: decision?.limits || null,
         },
       });
-      stage = "receipt:after";
+      stage = "buildValidateSignReceipt:after";
       logVerbStage({ debug_id, verb, stage, extra: { receipt_ok: receiptOut.ok } });
+      lastCompletedStage = stage;
 
-      stage = "response:before_send";
+      stage = "response:before_end";
       logVerbStage({ debug_id, verb, stage, extra: { http_status: receiptOut.ok ? 200 : receiptOut.http_status || 500 } });
+      lastCompletedStage = stage;
       respondNoStore(res);
       return res.status(receiptOut.ok ? 200 : receiptOut.http_status || 500).end(JSON.stringify(receiptOut.body));
     } catch (e) {
       trace.completed_at = nowIso();
       trace.duration_ms = Date.now() - started;
 
-      logVerbStage({ debug_id, verb, stage: "catch", level: "error", extra: { failed_stage: stage, message: String(e?.message || e).slice(0, 512), duration_ms: trace.duration_ms } });
+      logVerbStage({
+        debug_id,
+        verb,
+        stage: "catch",
+        level: "error",
+        extra: {
+          error_message: String(e?.message || e).slice(0, 512),
+          last_completed_stage: lastCompletedStage,
+          failed_stage: stage,
+          duration_ms: trace.duration_ms,
+        },
+      });
 
       let actor = null;
       try {
@@ -429,7 +480,7 @@ export function buildApp() {
       }
       const err = safeErrObj(e, verb);
 
-      stage = "receipt_error:before";
+      stage = "buildValidateSignReceipt:error_before";
       logVerbStage({ debug_id, verb, stage });
       const receiptOut = await buildValidateSignReceipt({
         verb,
@@ -443,11 +494,11 @@ export function buildApp() {
           usage: { verb, units: 1, duration_ms: trace.duration_ms, ts: nowIso(), path: "error" },
         },
       });
-      stage = "receipt_error:after";
+      stage = "buildValidateSignReceipt:error_after";
       logVerbStage({ debug_id, verb, stage, extra: { receipt_ok: receiptOut.ok } });
 
       const http = receiptOut.ok ? Number(e?.http_status || e?.status || 500) : receiptOut.http_status || 500;
-      stage = "response:before_send";
+      stage = "response:before_end";
       logVerbStage({ debug_id, verb, stage, extra: { http_status: http } });
       respondNoStore(res);
       return res.status(http).end(JSON.stringify(receiptOut.body));
