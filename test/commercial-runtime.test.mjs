@@ -133,7 +133,7 @@ async function ensureSharedTestInfra() {
   }
 }
 
-async function createRuntimeServer() {
+async function createRuntimeServer({ publicKeyEnvStyle = 'pem' } = {}) {
   await ensureSharedTestInfra();
   const { privateKey, publicKey } = sharedKeyPair;
   const env = {
@@ -143,10 +143,17 @@ async function createRuntimeServer() {
     SCHEMA_VERSION: '1.1.0',
     SCHEMA_HOST: sharedSchemaHost,
     RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64: Buffer.from(privateKey.export({ format: 'pem', type: 'pkcs8' })).toString('base64'),
-    RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64: Buffer.from(publicKey.export({ format: 'pem', type: 'spki' })).toString('base64'),
     DEFAULT_DAILY_FREE_CALLS: '1000',
     DEFAULT_RATE_RPS: '1000',
   };
+
+  if (publicKeyEnvStyle === 'raw') {
+    env.RECEIPT_SIGNING_PUBLIC_KEY_B64 = Buffer.from(publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)).toString('base64');
+    delete env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64;
+  } else {
+    env.RECEIPT_SIGNING_PUBLIC_KEY_PEM_B64 = Buffer.from(publicKey.export({ format: 'pem', type: 'spki' })).toString('base64');
+    delete env.RECEIPT_SIGNING_PUBLIC_KEY_B64;
+  }
 
   const previous = new Map();
   for (const [key, value] of Object.entries(env)) {
@@ -282,6 +289,68 @@ test('keeps receipt verification separate from the commercial verify verb route'
     assert.equal(receiptCheck.json.checks.signature_valid, true);
     assert.equal(receiptCheck.json.checks.schema_valid, true);
     assert.equal(receiptCheck.json.values.verb, 'authorize');
+  } finally {
+    await runtime.restore();
+  }
+});
+
+
+test('health and debug signer accept raw RECEIPT_SIGNING_PUBLIC_KEY_B64', { concurrency: false }, async () => {
+  const runtime = await createRuntimeServer({ publicKeyEnvStyle: 'raw' });
+  try {
+    const healthResponse = await fetch(`${runtime.baseUrl}/health`);
+    const health = await healthResponse.json();
+    assert.equal(healthResponse.status, 200);
+    assert.equal(health.keys.has_pub_b64, true);
+    assert.equal(health.keys.has_pub_pem_b64, false);
+    assert.equal(health.keys.has_pub_raw_b64, true);
+    assert.equal(health.keys.pub_ok, true);
+
+    const debugResponse = await fetch(`${runtime.baseUrl}/debug/signer`);
+    const debug = await debugResponse.json();
+    assert.equal(debugResponse.status, 200);
+    assert.equal(debug.ok, true);
+    assert.equal(debug.sign_ok, true);
+    assert.equal(debug.verify_ok_env_pub, true);
+    assert.equal(debug.has_pub_pem_b64, false);
+    assert.equal(debug.has_pub_raw_b64, true);
+    assert.equal(debug.public_key_source, 'env-raw-b64');
+  } finally {
+    await runtime.restore();
+  }
+});
+
+test('receipt verification still accepts PEM public-key env configuration', { concurrency: false }, async () => {
+  const runtime = await createRuntimeServer({ publicKeyEnvStyle: 'pem' });
+  try {
+    const { makeReceipt } = await import(`../src/receipts/sign.mjs?verify-pem=${Date.now()}-${Math.random()}`);
+    const receipt = makeReceipt({
+      signer_id: 'test-signer',
+      x402: { verb: 'authorize', version: '1.1.0', class: 'commercial', entry: 'x402://authorizeagent.eth/authorize/v1.1.0' },
+      trace: { trace_id: 'trace_pem_verify', started_at: new Date().toISOString(), completed_at: new Date().toISOString(), duration_ms: 1, provider: 'test' },
+      result: { approved: true },
+    });
+    const verify = await makeReceipt.verify({ receipt });
+    assert.equal(verify.ok, true);
+    assert.equal(verify.values.pubkey_source, 'env-pem-b64');
+  } finally {
+    await runtime.restore();
+  }
+});
+
+test('receipt verification accepts raw RECEIPT_SIGNING_PUBLIC_KEY_B64 configuration', { concurrency: false }, async () => {
+  const runtime = await createRuntimeServer({ publicKeyEnvStyle: 'raw' });
+  try {
+    const { makeReceipt } = await import(`../src/receipts/sign.mjs?verify-raw=${Date.now()}-${Math.random()}`);
+    const receipt = makeReceipt({
+      signer_id: 'test-signer',
+      x402: { verb: 'authorize', version: '1.1.0', class: 'commercial', entry: 'x402://authorizeagent.eth/authorize/v1.1.0' },
+      trace: { trace_id: 'trace_raw_verify', started_at: new Date().toISOString(), completed_at: new Date().toISOString(), duration_ms: 1, provider: 'test' },
+      result: { approved: true },
+    });
+    const verify = await makeReceipt.verify({ receipt });
+    assert.equal(verify.ok, true);
+    assert.equal(verify.values.pubkey_source, 'env-raw-b64');
   } finally {
     await runtime.restore();
   }
