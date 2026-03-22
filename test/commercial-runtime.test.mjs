@@ -133,7 +133,7 @@ async function ensureSharedTestInfra() {
   }
 }
 
-async function createRuntimeServer({ publicKeyEnvStyle = 'pem' } = {}) {
+async function createRuntimeServer({ publicKeyEnvStyle = 'pem', envOverrides = {} } = {}) {
   await ensureSharedTestInfra();
   const { privateKey, publicKey } = sharedKeyPair;
   const env = {
@@ -145,6 +145,7 @@ async function createRuntimeServer({ publicKeyEnvStyle = 'pem' } = {}) {
     RECEIPT_SIGNING_PRIVATE_KEY_PEM_B64: Buffer.from(privateKey.export({ format: 'pem', type: 'pkcs8' })).toString('base64'),
     DEFAULT_DAILY_FREE_CALLS: '1000',
     DEFAULT_RATE_RPS: '1000',
+    ...envOverrides,
   };
 
   if (publicKeyEnvStyle === 'raw') {
@@ -263,6 +264,67 @@ test('still accepts full normalized commercial envelopes', { concurrency: false 
     assert.equal(json.trace.parent_trace_id, 'parent_explicit');
     assert.equal(json.result.amount.value, '7.50');
     assert.equal(json.result.settlement.method, 'card');
+  } finally {
+    await runtime.restore();
+  }
+});
+
+
+
+test('can skip request validation in demo mode and still return signed receipts', { concurrency: false }, async () => {
+  const runtime = await createRuntimeServer({
+    envOverrides: {
+      SCHEMA_HOST: 'http://127.0.0.1:9',
+      COMMERCIAL_SKIP_REQUEST_VALIDATION: '1',
+      COMMERCIAL_SKIP_RECEIPT_VALIDATION: '1',
+    },
+  });
+  try {
+    const { response, json } = await postJson(runtime.baseUrl, '/authorize/v1.1.0', {
+      input: {
+        buyer: '0xDEMO',
+        amount: { value: '2.50', currency: 'USD' },
+        payment_method: 'demo',
+      },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(json.status, 'success');
+    assert.equal(json.x402.verb, 'authorize');
+    assert.ok(json.metadata?.proof?.signature_b64);
+
+    const healthResponse = await fetch(`${runtime.baseUrl}/health`);
+    const health = await healthResponse.json();
+    assert.equal(health.skip_request_validation, true);
+    assert.equal(health.skip_receipt_validation, true);
+
+    const debugResponse = await fetch(`${runtime.baseUrl}/debug/env`);
+    const debug = await debugResponse.json();
+    assert.equal(debug.skip_request_validation, true);
+    assert.equal(debug.skip_receipt_validation, true);
+  } finally {
+    await runtime.restore();
+  }
+});
+
+test('request validation remains enforced when skip flag is unset', { concurrency: false }, async () => {
+  const runtime = await createRuntimeServer();
+  try {
+    const { response, json } = await postJson(runtime.baseUrl, '/authorize/v1.1.0', {
+      x402: {
+        verb: 'authorize',
+        version: '1.1.0',
+        class: 'commercial',
+        entry: 'x402://authorizeagent.eth/authorize/v1.1.0',
+      },
+      trace: {
+        trace_id: 'trace_invalid_payload',
+      },
+      payload: 'not-an-object',
+    });
+
+    assert.equal(response.status, 400);
+    assert.equal(json.error, 'schema_validation_failed');
   } finally {
     await runtime.restore();
   }

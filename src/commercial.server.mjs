@@ -98,39 +98,57 @@ function safeTail(s, n = 24) {
   return String(s || "").slice(-n);
 }
 
-async function buildValidateSignReceipt({ verb, signer_id, x402, trace, result, status = "success", error = null, actor = null, metadata_patch = null } = {}) {
-  const unsigned = buildUnsignedReceipt({ signer_id, x402, trace, result, status, error, actor, metadata_patch });
-  let validate;
-  try {
-    validate = await getValidatorForVerb(verb);
-  } catch (e) {
-    return {
-      ok: false,
-      http_status: 500,
-      body: {
-        ok: false,
-        error: "receipt_schema_invalid",
-        kind: "receipt",
-        verb,
-        message: "Failed to load receipt schema validator",
-        details: [{ message: String(e?.message || e) }],
-      },
-    };
-  }
+function envFlagEnabled(name) {
+  return process.env[name] === "1";
+}
 
-  const ok = validate(unsigned);
-  if (!ok) {
-    return {
-      ok: false,
-      http_status: 500,
-      body: {
+async function buildValidateSignReceipt({
+  verb,
+  signer_id,
+  x402,
+  trace,
+  result,
+  status = "success",
+  error = null,
+  actor = null,
+  metadata_patch = null,
+  skipReceiptValidation = false,
+} = {}) {
+  const unsigned = buildUnsignedReceipt({ signer_id, x402, trace, result, status, error, actor, metadata_patch });
+
+  if (!skipReceiptValidation) {
+    let validate;
+    try {
+      validate = await getValidatorForVerb(verb);
+    } catch (e) {
+      return {
         ok: false,
-        error: "receipt_schema_invalid",
-        kind: "receipt",
-        verb,
-        details: ajvErrorsToSimple(validate.errors) || [],
-      },
-    };
+        http_status: 500,
+        body: {
+          ok: false,
+          error: "receipt_schema_invalid",
+          kind: "receipt",
+          verb,
+          message: "Failed to load receipt schema validator",
+          details: [{ message: String(e?.message || e) }],
+        },
+      };
+    }
+
+    const ok = validate(unsigned);
+    if (!ok) {
+      return {
+        ok: false,
+        http_status: 500,
+        body: {
+          ok: false,
+          error: "receipt_schema_invalid",
+          kind: "receipt",
+          verb,
+          details: ajvErrorsToSimple(validate.errors) || [],
+        },
+      };
+    }
   }
 
   try {
@@ -251,6 +269,8 @@ export function buildApp() {
 
   const ENABLED_VERBS = parseEnabledVerbs();
   const enabled = (verb) => ENABLED_VERBS.includes(verb);
+  const SKIP_REQUEST_VALIDATION = envFlagEnabled("COMMERCIAL_SKIP_REQUEST_VALIDATION");
+  const SKIP_RECEIPT_VALIDATION = envFlagEnabled("COMMERCIAL_SKIP_RECEIPT_VALIDATION");
 
   // Receipt signer label (not the key itself)
   const SIGNER_ID = process.env.RECEIPT_SIGNER_ID || process.env.ENS_NAME || "commercial-runtime";
@@ -338,49 +358,55 @@ export function buildApp() {
       );
     }
 
-    let validateReq;
-    try {
-      stage = "getRequestValidator:before";
-      logVerbStage({ debug_id, verb, stage });
-      validateReq = await getRequestValidator(verb);
-      stage = "getRequestValidator:after";
-      logVerbStage({ debug_id, verb, stage });
+    if (SKIP_REQUEST_VALIDATION) {
+      stage = "requestValidation:skipped";
+      logVerbStage({ debug_id, verb, stage, extra: { skip_request_validation: true } });
       lastCompletedStage = stage;
-    } catch (e) {
-      logVerbStage({
-        debug_id,
-        verb,
-        stage: "catch",
-        level: "error",
-        extra: { error_message: String(e?.message || e).slice(0, 512), last_completed_stage: lastCompletedStage, failed_stage: stage },
-      });
-      respondNoStore(res);
-      return res.status(500).end(
-        JSON.stringify({
-          ok: false,
-          error: "request_schema_unavailable",
-          kind: "request",
+    } else {
+      let validateReq;
+      try {
+        stage = "getRequestValidator:before";
+        logVerbStage({ debug_id, verb, stage });
+        validateReq = await getRequestValidator(verb);
+        stage = "getRequestValidator:after";
+        logVerbStage({ debug_id, verb, stage });
+        lastCompletedStage = stage;
+      } catch (e) {
+        logVerbStage({
+          debug_id,
           verb,
-          details: [{ message: String(e?.message || e) }],
-        })
-      );
-    }
+          stage: "catch",
+          level: "error",
+          extra: { error_message: String(e?.message || e).slice(0, 512), last_completed_stage: lastCompletedStage, failed_stage: stage },
+        });
+        respondNoStore(res);
+        return res.status(500).end(
+          JSON.stringify({
+            ok: false,
+            error: "request_schema_unavailable",
+            kind: "request",
+            verb,
+            details: [{ message: String(e?.message || e) }],
+          })
+        );
+      }
 
-    stage = "requestValidation:result";
-    const reqSchemaOk = validateReq(normalized);
-    logVerbStage({ debug_id, verb, stage, extra: { ok: reqSchemaOk, error_count: Array.isArray(validateReq.errors) ? validateReq.errors.length : 0 } });
-    lastCompletedStage = stage;
-    if (!reqSchemaOk) {
-      respondNoStore(res);
-      return res.status(400).end(
-        JSON.stringify({
-          ok: false,
-          error: "schema_validation_failed",
-          kind: "request",
-          verb,
-          details: formatAjvErrors(validateReq.errors),
-        })
-      );
+      stage = "requestValidation:result";
+      const reqSchemaOk = validateReq(normalized);
+      logVerbStage({ debug_id, verb, stage, extra: { ok: reqSchemaOk, error_count: Array.isArray(validateReq.errors) ? validateReq.errors.length : 0 } });
+      lastCompletedStage = stage;
+      if (!reqSchemaOk) {
+        respondNoStore(res);
+        return res.status(400).end(
+          JSON.stringify({
+            ok: false,
+            error: "schema_validation_failed",
+            kind: "request",
+            verb,
+            details: formatAjvErrors(validateReq.errors),
+          })
+        );
+      }
     }
 
     const x402 = normalized.x402;
@@ -445,6 +471,7 @@ export function buildApp() {
           billing: decision?.billing || null,
           limits: decision?.limits || null,
         },
+        skipReceiptValidation: SKIP_RECEIPT_VALIDATION,
       });
       stage = "buildValidateSignReceipt:after";
       logVerbStage({ debug_id, verb, stage, extra: { receipt_ok: receiptOut.ok } });
@@ -493,6 +520,7 @@ export function buildApp() {
         metadata_patch: {
           usage: { verb, units: 1, duration_ms: trace.duration_ms, ts: nowIso(), path: "error" },
         },
+        skipReceiptValidation: SKIP_RECEIPT_VALIDATION,
       });
       stage = "buildValidateSignReceipt:error_after";
       logVerbStage({ debug_id, verb, stage, extra: { receipt_ok: receiptOut.ok } });
@@ -546,6 +574,8 @@ export function buildApp() {
         enabled_verbs: ENABLED_VERBS,
         signer_id: SIGNER_ID,
         signer_ok: !!kh.priv_ok,
+        skip_request_validation: SKIP_REQUEST_VALIDATION,
+        skip_receipt_validation: SKIP_RECEIPT_VALIDATION,
         keys: {
           has_priv_b64: kh.has_priv_b64,
           has_pub_b64: kh.has_pub_b64,
@@ -578,6 +608,8 @@ export function buildApp() {
         canonical_base_url: CANONICAL_BASE,
         schema_host: process.env.SCHEMA_HOST || "https://www.commandlayer.org",
         billing_provider: process.env.BILLING_PROVIDER || "none",
+        skip_request_validation: SKIP_REQUEST_VALIDATION,
+        skip_receipt_validation: SKIP_RECEIPT_VALIDATION,
         verifier_ens_name: process.env.VERIFIER_ENS_NAME || null,
         ens_pubkey_text_key: process.env.ENS_PUBKEY_TEXT_KEY || "cl.receipt.pubkey.pem",
         keys: kh,
