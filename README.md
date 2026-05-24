@@ -1,95 +1,57 @@
-# commercial-runtime
+# Deprecated: CommandLayer Commercial Runtime
 
-CommandLayer commercial runtime for the commercial verbs `authorize`, `checkout`, `purchase`, `ship`, and `verify`.
+This repository is deprecated and should be treated as an archived historical source.
 
-## Live HTTP surface
+Commercial runtime and backend work has moved to the private `commandlayer/commercial` repo.
 
-### Commercial verb routes
+## Current direction
 
-The live commercial verb surface is versioned at `v1.1.0`:
+CommandLayer is consolidating around CLAS and verifiable action receipts.
 
-- `POST /authorize/v1.1.0`
-- `POST /checkout/v1.1.0`
-- `POST /purchase/v1.1.0`
-- `POST /ship/v1.1.0`
-- `POST /verify/v1.1.0`
+Going forward:
 
-### Receipt verification route
+- canonical CLAS/spec work lives in `commandlayer/clas`
+- active SDK work lives in `commandlayer/agent-sdk`
+- public verification/docs live in `commandlayer/commandlayer-org`
+- private commercial/admin/payment/backend work lives in `commandlayer/commercial`
+- execution/runtime infrastructure remains private until intentionally published
 
-`POST /verify` is a separate receipt verification endpoint.
+Do not use this repository as the active runtime for new CommandLayer integrations.
 
-- `POST /verify/v1.1.0` = commercial business-flow `verify` verb
-- `POST /verify` = receipt signature verification, with optional schema verification
+## Why this repo is being archived
 
-The index (`GET /`) and health (`GET /health`) metadata report the runtime as service version `1.1.0` and API version `1.1.0` by default.
+This repository previously represented an experimental commercial runtime surface for commercial verbs, x402-oriented flows, and receipt verification behavior.
 
-## Request contract
+That public surface is being retired. Payment flows, admin operations, checkout/session creation, webhooks, card publication internals, and commercial execution rails are now private backend concerns.
 
-The runtime still accepts the full normalized commercial envelope:
+This repository is retained only so older references and historical runtime experiments remain understandable.
 
-```json
-{
-  "x402": {
-    "verb": "authorize",
-    "version": "1.1.0",
-    "class": "commercial",
-    "entry": "x402://authorizeagent.eth/authorize/v1.1.0"
-  },
-  "trace": {
-    "trace_id": "trace_explicit",
-    "parent_trace_id": "trace_parent"
-  },
-  "payload": {
-    "buyer": "0xBEEF"
-  }
-}
-```
+## Historical scope
 
-For browser pages and demos, the runtime also accepts a compatibility input adapter:
+This repository previously contained or described:
 
-```json
-{
-  "input": {
-    "buyer": "0xBEEF",
-    "chain_id": "eip155:84532",
-    "amount": { "value": "0.0001", "currency": "ETH" },
-    "payment_method": "demo"
-  }
-}
-```
+- commercial verb HTTP routes
+- x402-oriented execution envelopes
+- checkout/purchase/ship/verify-style route experiments
+- receipt signing and verification behavior for commercial flows
+- frontend compatibility adapters for demos
 
-When the adapter is used, the runtime normalizes the request internally before schema validation and execution:
+New integrations should not target this runtime.
 
-- `x402.verb` is derived from the matched route verb.
-- `x402.version` defaults to `1.1.0`.
-- `x402.class` remains `commercial`.
-- `x402.entry` is built as `x402://<verb>agent.eth/<verb>/v1.1.0`.
-- `trace.trace_id` is auto-generated if the caller did not supply one.
-- `trace.parent_trace_id` is preserved when provided at the top level or inside `input`.
-- `payload` is derived from `input`.
+## Recommended path
 
-This adapter is only a frontend convenience layer. The internal commercial contract still uses explicit `x402`, `trace`, and `payload` fields.
+Use the current CommandLayer repos instead:
 
-## Commercial semantics kept intact
+- CLAS/spec: https://github.com/commandlayer/clas
+- Agent SDK: https://github.com/commandlayer/agent-sdk
+- Public verifier/docs: https://github.com/commandlayer/commandlayer-org
+- VerifyAgent reference: https://github.com/commandlayer/verifyagent
 
-This change does **not** remove or replace commercial protocol behavior:
+Private commercial backend/runtime work remains in `commandlayer/commercial`.
 
-- x402 request semantics are still preserved internally.
-- request schema validation is still enforced.
-- receipt schema validation is still enforced.
-- receipt signing is still enforced.
-- receipt verification remains available at `POST /verify`.
-- CORS headers remain enabled for browser callers.
+## Status
 
-## Configuration
-
-Environment defaults:
-
-- `SERVICE_VERSION=1.1.0`
-- `API_VERSION=1.1.0`
-- `SCHEMA_VERSION` defaults to `API_VERSION`
-
-## Checks
-
-- `npm run contract-check`
-- `node --test test/commercial-runtime.test.mjs`
+- Repository status: deprecated / archive candidate
+- New development: no
+- New integrations: use CLAS + Agent SDK
+- Commercial backend/runtime: private `commandlayer/commercial`
